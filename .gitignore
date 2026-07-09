@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyc
+
+# Environments
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project-specific: keep these OFF GitHub
+scratch/
+notebooks/private/
+data/
+*.h5
+*.hdf5
+*.dat
+examples/
+*.asc
+*.csv
+*.txt

@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sottools"
+version = "0.1.0"
+description = "SQUID-on-tip current imaging forward and inverse modeling"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    { name = "Matthijs Rog", email = "rog@physics.leidenuniv.nl" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "matplotlib",
+    "tqdm",
+    "triangle",
+]
+
+[project.optional-dependencies]
+jupyter = [
+    "IPython"
+]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "types-tqdm"
+]
+docs = [
+    "sphinx",
+    "myst-nb",
+    "sphinx-rtd-theme",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/sottools"
+Documentation = "https://sottools.readthedocs.io"
+Repository = "https://github.com/yourusername/sottools"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["sottools*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F",
+    "I",
+    "UP",
+    "B",
+    "NPY",
+    "D",
+]
+ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+"src/sottools/utils/*" = ["D"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+plugins = []
+
+[[tool.mypy.overrides]]
+module = [
+    "triangle",
+    "scipy.*",
+    "IPython.display.*",
+    "sottools.utils.*"
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sottools.mesh"]
+warn_return_any = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["sottools"]
+omit = ["src/sottools/utils/*"]
