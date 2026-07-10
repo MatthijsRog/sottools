@@ -44,4 +44,4 @@ pip install sottools[jupyter]
 
 ## Documentation
 
-Coming soon at [sottools.readthedocs.io](https://sottools.readthedocs.io)
+Documentation is available at [sottools.readthedocs.io](https://sottools.readthedocs.io)
