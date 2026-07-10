@@ -16,7 +16,9 @@ for path in NOTEBOOKS:
         "pygments_lexer": "ipython3",
         "version": "3.12.8",
     }
-    path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     print(f"Fixed: {path}")
 
 for cell in nb.get("cells", []):

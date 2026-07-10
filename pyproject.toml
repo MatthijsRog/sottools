@@ -63,6 +63,7 @@ sottools = ["py.typed"]
 line-length = 88
 target-version = "py312"
 src = ["src", "tests"]
+extend-exclude = ["docs/"]
 
 [tool.ruff.lint]
 select = [
