@@ -13,4 +13,4 @@ The utils folder contains various utility functions for plotting and mesh
 generation.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

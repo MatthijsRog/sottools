@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sottools"
-version = "0.1.1"
+version = "0.1.2"
 description = "SQUID-on-tip current imaging forward and inverse modeling"
 readme = "README.md"
 license = "MIT"
@@ -44,6 +44,7 @@ docs = [
     "sphinx",
     "myst-nb",
     "sphinx-rtd-theme",
+    "furo"
 ]
 
 [project.urls]

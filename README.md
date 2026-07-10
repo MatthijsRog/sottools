@@ -39,7 +39,7 @@ If GPU acceleration is desired, install the PyTorch version with CUDA support fi
 For easier usage with Jupyter notebooks, install the optional dependencies:
 
 ```bash
-pip install sottools[notebook]
+pip install sottools[jupyter]
 ```
 
 ## Documentation

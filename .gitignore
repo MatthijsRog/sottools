@@ -28,3 +28,4 @@ examples/
 *.asc
 *.csv
 *.txt
+docs/_build/
