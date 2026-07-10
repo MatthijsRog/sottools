@@ -158,7 +158,7 @@ class JupyterCallback:
         import IPython.display
 
         self._losses.append((state.step, state.loss))
-        IPython.display.clear_output(wait=True)  # type: ignore[no-untyped-call]
+        IPython.display.clear_output(wait=True)  # type: ignore[no-untyped-call,unused-ignore]
 
         if self._fig is None:
             fig, axarr = plt.subplots(3, 1, figsize=(5, 11))
@@ -192,7 +192,7 @@ class JupyterCallback:
         ax_loss.semilogy(steps, losses)
 
         self._fig.tight_layout()
-        IPython.display.display(self._fig)  # type: ignore[no-untyped-call]
+        IPython.display.display(self._fig)  # type: ignore[no-untyped-call,unused-ignore]
 
     def on_finish(self, state: FitState1D) -> None:
         """Call after the last step of a 1D fit.

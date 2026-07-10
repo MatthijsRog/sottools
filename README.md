@@ -1,3 +1,9 @@
+[![CI](https://github.com/MatthijsRog/sottools/actions/workflows/ci.yml/badge.svg)](https://github.com/MatthijsRog/sottools/actions)
+[![PyPI](https://img.shields.io/pypi/v/sottools)](https://pypi.org/project/sottools/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Typed](https://img.shields.io/badge/typed-mypy%20strict-blue)](http://mypy-lang.org/)
+
 # SOTtools
 
 ⚠️ **SOTtools is under development** — API may change between minor versions, and old code may break.
