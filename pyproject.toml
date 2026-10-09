@@ -74,7 +74,7 @@ select = [
     "NPY",
     "D",
 ]
-ignore = ["D105", "D107"]
+ignore = ["D105", "D107", "E731"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"

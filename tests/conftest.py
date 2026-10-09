@@ -89,8 +89,9 @@ def inverter1d_with_random_currents() -> tuple[backward.Inverter1D, np.ndarray]:
 
     fwd = forward.Forward1D(params)
     signal = fwd.forward(current)
+    zeroregularizer = 0.0 * backward.Tikhonov1()
 
-    inverter = backward.Inverter1D(fwd, signal)
+    inverter = backward.Inverter1D(fwd, signal, zeroregularizer)
 
     return inverter, current
 
@@ -122,8 +123,9 @@ def oversampledinverter1d_with_random_currents() -> tuple[
     # Undersample the output signal on a coarser grid
     yscan = np.linspace(yscan_original.min(), yscan_original.max(), 195)
     signal = np.interp(yscan, yscan_original, signal_original)
+    zeroregularizer = 0.0 * backward.Tikhonov1()
 
-    inverter = backward.Inverter1DOversampled(fwd, yscan, signal)
+    inverter = backward.Inverter1DOversampled(fwd, yscan, signal, zeroregularizer)
 
     return inverter, current
 

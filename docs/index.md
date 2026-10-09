@@ -27,5 +27,6 @@ installation
 tutorials/Tutorial_1DForward
 tutorials/Tutorial_1DBackward
 tutorials/Tutorial_2DForward
+kernelmath
 api/index
 ```

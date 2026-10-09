@@ -21,7 +21,7 @@ DTYPE = torch.float32
 
 
 class Forward1DParameters:
-    """Parameters describing a 1D forwrad calculation from current to SOT image.
+    """Parameters describing a 1D forward calculation from current to SOT image.
 
     The forward pass of the 1D model relies on parameters describing:
     - The spatial resolution and constraints of the model
@@ -301,9 +301,9 @@ class Forward1D:
 
     The forward model for 1D current reconstruction. An instance of this
     class uses Forward1DParameters to pre-compute the SQUID-response kernel
-    (Foward1D._precompute_kernel) and can then use this kernel to convert
-    between a current distribution j(y'') on the device and a squid signal
-    S(y) along the scan-axis.
+    (or compute on the fly for simulteaneous inference of SQUID parameters)
+    and can then use this kernel to convert between a current distribution
+    j(y'') on the device and a squid signal S(y) along the scan-axis.
 
     Parameters
     ----------
@@ -311,9 +311,11 @@ class Forward1D:
         An instance of Forward1DParameters containing the parameters for the
         forward model.
     n_alpha: int
-        Number of alpha angles to use in the kernel precomputation. Defaults to 32.
+        Number of alpha angles to use in the kernel precomputation. Defaults to 16.
     n_rho: int
-        Number of rho values to use in the kernel precomputation. Defaults to 32.
+         Number of rho points to use in the kernel precomputation (Gauss-Legendre
+         quadrature). Defaults to 6. Note: this is points per part of the
+         window function, so the total number of points is 2*n_rho.
     device: torch.device
         The device on which to perform all torch computations. Defaults to CPU.
     mu0: float
@@ -331,8 +333,8 @@ class Forward1D:
     def __init__(
         self,
         params: Forward1DParameters,
-        n_alpha: int = 32,
-        n_rho: int = 32,
+        n_alpha: int = 16,
+        n_rho: int = 6,
         device: torch.device | None = None,
         mu0: float = 4 * np.pi * 1e-1,
         verbose: bool = False,
@@ -342,15 +344,22 @@ class Forward1D:
 
         if n_alpha % 2 != 0:
             raise ValueError("n_alpha must be an even integer.")
+        if n_rho < 1:
+            raise ValueError("n_rho must be a positive integer.")
 
         self._params = params
         self._n_alpha = n_alpha
-        self._n_rho = n_rho
         self._device = device
         self._verbose = verbose
         self._mu0 = mu0
 
-        self._kernel, self._kernel_fft = self._precompute_kernel()
+        self._n_rho = n_rho
+        # Gauss-Legendre nodes and weights on [-1, 1]
+        x, w = np.polynomial.legendre.leggauss(n_rho)
+        self._gl_x = torch.as_tensor(x, dtype=DTYPE, device=self._device)
+        self._gl_w = torch.as_tensor(w, dtype=DTYPE, device=self._device)
+
+        self._kernel, self._kernel_fft = self._compute_standard_kernel()
 
     @property
     def params(self) -> Forward1DParameters:
@@ -367,7 +376,31 @@ class Forward1D:
         Upon setting, instantly precomputes all kernels again.
         """
         self._params = params
-        self._kernel, self._kernel_fft = self._precompute_kernel()
+        self._kernel, self._kernel_fft = self._compute_standard_kernel()
+
+    def _compute_standard_kernel(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the SQUID response kernel for the current parameters.
+
+        Returns
+        -------
+        kernel: torch.Tensor
+            The SQUID response kernel in real space, shape (3*Nscan,)
+        kernel_fft: torch.Tensor
+            The SQUID response kernel in Fourier space, shape (3*Nscan,)
+        """
+
+        def T(v: float | torch.Tensor) -> torch.Tensor:
+            return torch.as_tensor(v, dtype=DTYPE, device=self._device)
+
+        return self._compute_kernel(
+            T(self._params.height),
+            T(self._params.rho1),
+            T(self._params.rho2),
+            T(self._params.phi_eff),
+            T(self._params.gamma),
+            self._params.kernel_sign,
+            self._ykernel(),
+        )
 
     # To prevent wrapping artifacts in the convolution, we introduce the
     # following rules:
@@ -398,88 +431,99 @@ class Forward1D:
         )
         return ykernel
 
-    def _window(self, rho: float) -> float:
-        """Return the window that tapers the repeated, mirrored current distribution.
+    def _compute_kernel(
+        self,
+        height: torch.Tensor,
+        rho1: torch.Tensor,
+        rho2: torch.Tensor,
+        phi: torch.Tensor,
+        gamma: torch.Tensor,
+        kernel_sign: float,
+        ykernel: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the SQUID response kernel for the current parameters.
 
-        The window function:
-        w(rho) = 1 for rho < rho1
-                 1 - (rho-rho1)/(rho2-rho1) for rho1 <= rho < rho2
-                   0 for rho >= rho2
+        All inputs and outputs are torch tensors such that the kernel is in principle
+        fully differentiable, should we want to optimize SQUID parameters together with
+        other inference.
+
+        Parameters
+        ----------
+        height: torch.tensor
+            Height of the SQUID above the device.
+        rho1: torch.tensor
+            Inner radius of the SQUID (flat part of the window).
+        rho2: torch.tensor
+            Outer radius of the SQUID (where the window goes to zero).
+        phi: torch.tensor
+            SQUID tilt angle. Does not account for invert_scan (i.e., pass in phi_eff).
+        gamma: torch.tensor
+            Current bar tilt angle.
+        kernel_sign: float
+            Sign of the kernel.
+        ykernel: torch.Tensor
+            The y-axis on which the kernel is defined. Length 3*Nscan.
+
+        Returns
+        -------
+        kernel: torch.Tensor
+            The SQUID response kernel in real space, shape (3*Nscan,)
+        kernel_fft: torch.Tensor
+            The SQUID response kernel in Fourier space, shape (3*Nscan,)
+
+        Comments
+        --------
+        Gamma cannot be autodifferentiated because it is connected to ykernel.
+        With the closed-form integral in rho, all computations must be performed in
+        float64 regardless of DTYPE. This is further documented in "kernelmath.md".
         """
-        if rho < self._params.rho1:
-            return 1.0
-        elif rho < self._params.rho2:
-            return 1.0 - (rho - self._params.rho1) / (
-                self._params.rho2 - self._params.rho1
-            )
-        else:
-            return 0.0
-
-    def _kernel_contribution(
-        self, ykernel: torch.Tensor, alpha: float, rho: float
-    ) -> torch.Tensor:
-        """Calculate single kernel term (no prefactor) for given alpha and rho."""
-        phi = self._params.phi_eff
-        gamma = self._params.gamma
-        h = self._params.height
-
-        numerator = 2 * (
-            ykernel * np.cos(phi)
-            - np.cos(gamma) * np.sin(phi) * h
-            - rho
-            * (
-                np.cos(alpha) * np.sin(gamma) * np.cos(phi)
-                + np.cos(gamma) * np.sin(alpha)
-            )
-        )
-        denominator = (
-            ykernel
-            - rho
-            * (
-                np.cos(alpha) * np.sin(gamma)
-                + np.cos(gamma) * np.sin(alpha) * np.cos(phi)
-            )
-        ) ** 2 + (h + rho * np.sin(alpha) * np.sin(phi)) ** 2
-
-        contribution: torch.Tensor = numerator / denominator
-        return contribution
-
-    def _precompute_kernel(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Precompute the SQUID response kernel for the current parameters."""
         n_alpha = self._n_alpha  # Alpha runs from zero to 2pi non-inclusive
-        n_rho = self._n_rho  # Rho runs from 0.5*rho2/n_rho to rho2-0.5*rho2/n_rho
-        # non-inclusive on both sides
-        ykernel = self._ykernel()
-
-        kernel = torch.zeros(3 * self._params.Nscan, device=self._device)
-
         dalpha = 2 * np.pi / n_alpha
-        drho = self._params.rho2 / n_rho
+        alphas = (
+            torch.arange(n_alpha, dtype=DTYPE, device=self._device) + 0.5
+        ) * dalpha
+        # Offset by dalpha/2: the grid stays symmetric under
+        # alpha -> alpha + pi for even n_alpha (needed for the invert_scan identity).
 
-        alpha_iter: Iterable[torch.Tensor] = torch.linspace(
-            0.0, 2 * np.pi - dalpha, n_alpha
-        )
-        if self._verbose:
-            print("Precomputing kernel...")
-            alpha_iter = tqdm(alpha_iter, desc="Kernel (alpha)")
-        rho_iter = torch.linspace(0.5 * drho, self._params.rho2 - 0.5 * drho, n_rho)
-        for alpha in alpha_iter:
-            for rho in rho_iter:
-                w = self._window(rho)
-                if w == 0.0:
-                    continue
+        h, r1, r2, phi, gamma = (t.to(DTYPE) for t in (height, rho1, rho2, phi, gamma))
+        if float(h.detach()) <= float(r2.detach()) * abs(np.sin(float(phi.detach()))):
+            raise ValueError(
+                "SQUID loop intersects the sample: height <= rho2*|sin(phi)|."
+            )
 
-                # Calculate the contribution of this (alpha, rho) to the kernel
-                y_contribution = self._kernel_contribution(ykernel, float(alpha), rho)
+        c1 = torch.cos(phi)
+        c2 = torch.cos(gamma) * torch.sin(phi)
 
-                # Add the contribution to the kernel, weighted by the window function
-                kernel += rho * w * y_contribution * dalpha * drho
+        # Gauss-Legendre in rho, split at rho1 (see kernelmath.md):
+        # inner [0, rho1] with W = 1, outer [rho1, rho2] with W = (1 - x)/2.
+        x, wgl = self._gl_x, self._gl_w  # (n_rho,)
+        rho_in = 0.5 * r1 * (1 + x)
+        rho_out = r1 + 0.5 * (r2 - r1) * (1 + x)
+        q_in = (0.5 * r1) ** 2 * wgl * (1 + x)
+        q_out = 0.5 * (r2 - r1) * wgl * rho_out * 0.5 * (1 - x)
+        rho = torch.cat([rho_in, rho_out])[None, :, None]  # (1, 2*n_rho, 1)
+        q = torch.cat([q_in, q_out])  # (2*n_rho,)
 
-        kernel *= self._params.kernel_sign
+        # Integrand g on the (alpha, rho, u) grid
+        alphas = alphas[:, None, None]  # (n_alpha, 1, 1)
+        u = ykernel.to(DTYPE)[None, None, :]  # (1, 1, M)
+        A = torch.cos(alphas) * torch.sin(gamma) + torch.cos(gamma) * torch.sin(
+            alphas
+        ) * torch.cos(phi)
+        B = torch.sin(alphas) * torch.sin(phi)
+        py = u - A * rho  # p_y''
+        pz = h + B * rho  # p_z
+        g = 2 * (c1 * py - c2 * pz) / (py**2 + pz**2)  # (n_alpha, 2*n_rho, M)
 
-        return kernel.to(self._device), torch.fft.fft(kernel).to(self._device)
+        kernel = torch.einsum("r,arm->m", q, g) * dalpha  # (M,)
+        kernel *= kernel_sign
+        kernel = kernel.to(self._device, dtype=DTYPE)
 
-    def forward_t(self, current: torch.Tensor) -> torch.Tensor:
+        return kernel, torch.fft.fft(kernel).to(self._device)
+
+    def forward_t(
+        self, current: torch.Tensor, sensorparameters: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Compute the 1D SQUID signal from a 1D current distribution on the device.
 
         Uses the pre-computed kernel and Fourier methods to calculate the 1D SQUID
@@ -494,6 +538,11 @@ class Forward1D:
         current: torch.Tensor
             A tensor of shape (Ndevice,) representing the current distribution j(y'')
             on the device.
+        sensorparameters: torch.Tensor | None
+            An optional tensor. If None, use precomputed kernel. If provided, it should
+            be a tensor of shape (4,) containing the parameters (height, rho1, rho2,
+            phi_eff) to compute a new kernel on the fly. This allows for dynamic
+            adjustment of sensor parameters during inference.
 
         Returns
         -------
@@ -505,7 +554,9 @@ class Forward1D:
         # Step 1: Extend the current distribution to the length of the
         # projected scan axis + Nscan zero padding on both sides of the
         # projected scan axis
-        current_extended = torch.zeros(3 * self._params.Nscan, device=self._device)
+        current_extended = torch.zeros(
+            3 * self._params.Nscan, device=self._device, dtype=DTYPE
+        )
 
         start_idx = (
             self._params.Nscan + (self._params.Nscan - self._params.Ndevice) // 2
@@ -514,7 +565,19 @@ class Forward1D:
 
         # Step 2: Convolve with kernel using FFT
         current_fft = torch.fft.fft(current_extended)
-        kernel_fft = self._kernel_fft  # Precomputed FFT of the kernel
+        if sensorparameters is not None:
+            height, rho1, rho2, phi_eff = sensorparameters
+            _, kernel_fft = self._compute_kernel(
+                height,
+                rho1,
+                rho2,
+                phi_eff,
+                torch.as_tensor(self._params.gamma, dtype=DTYPE, device=self._device),
+                self._params.kernel_sign,
+                self._ykernel(),
+            )
+        else:
+            kernel_fft = self._kernel_fft  # Precomputed FFT of the kernel
         signal_proj_fft = current_fft * kernel_fft  # Shape: (3*Nscan,)
         # Represents SQUID signal on projected y-axis y''=cos(gamma)*y before rescaling.
         signal_proj = torch.fft.ifft(signal_proj_fft).real * dyproj
@@ -752,8 +815,6 @@ class Forward2DCurrent:
         forward model.
     n_alpha: int
         Number of alpha angles to use in the kernel precomputation. Defaults to 32.
-    n_rho: int
-        Number of rho values to use in the kernel precomputation. Defaults to 32.
     device: torch.device
         The device on which to perform all torch computations. Defaults to CPU.
     mu0: float

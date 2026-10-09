@@ -37,57 +37,50 @@ def test_regularizers_1d():
     rng = np.random.default_rng(0)
 
     params = forward.Forward1DParameters(Lscan=10.0, Wdevice=5, Nscan=100)
-    inverter = backward.Inverter1D(forward.Forward1D(params), np.zeros(params.Nscan))
 
     # Test TV-1 regularization: flat functions are in the null-space
-    inverter.lam1 = 1.0
-    inverter.lam2 = 0.0
-    inverter.lam3 = 0.0
-    inverter.lam4 = 0.0
-    reg = inverter._regularization(torch.ones(params.Ndevice)).detach().cpu().numpy()
+    regularizer = backward.TV1()
+    reg = regularizer(torch.ones(params.Ndevice)).detach().cpu().numpy()
     assert np.isclose(reg, 0.0, atol=1e-5)
 
     # Test TV-2 regularization: linear functions AND flat functions are in the
     # null-space
-    inverter.lam1 = 0.0
-    inverter.lam2 = 1.0
-    inverter.lam3 = 0.0
-    inverter.lam4 = 0.0
+    regularizer = backward.TV2()
     ydevice = params.ydevice.detach().cpu().numpy()
     linear_func = ydevice
-    reg = inverter._regularization(torch.from_numpy(linear_func)).detach().cpu().numpy()
+    reg = regularizer(torch.from_numpy(linear_func)).detach().cpu().numpy()
     assert np.isclose(reg, 0.0, atol=1e-5)
     flat_func = np.ones(params.Ndevice)
-    reg = inverter._regularization(torch.from_numpy(flat_func)).detach().cpu().numpy()
+    reg = regularizer(torch.from_numpy(flat_func)).detach().cpu().numpy()
     assert np.isclose(reg, 0.0, atol=1e-5)
 
     # Test positivity regularization: all-positive function with much detail
     # should still be in null-space
-    inverter.lam1 = 0.0
-    inverter.lam2 = 0.0
-    inverter.lam3 = 1.0
-    inverter.lam4 = 0.0
+    regularizer = backward.Positivity()
     detailed_positive_func = rng.uniform(0.0, 1.0, size=params.Ndevice)
-    reg = (
-        inverter._regularization(torch.from_numpy(detailed_positive_func))
-        .detach()
-        .cpu()
-        .numpy()
-    )
+    reg = regularizer(torch.from_numpy(detailed_positive_func)).detach().cpu().numpy()
     assert np.isclose(reg, 0.0, atol=1e-5)
 
     # Test edge positivity: negative in bulk, positive at edges should be in null-space
-    inverter.lam1 = 0.0
-    inverter.lam2 = 0.0
-    inverter.lam3 = 0.0
-    inverter.lam4 = 1.0
-    inverter.n_edge = 10
+    regularizer = backward.EdgeRingingSuppression(n_edge=10)
     detailed_func = rng.uniform(-1.0, 1.0, size=params.Ndevice)
-    detailed_func[: inverter.n_edge] = rng.uniform(0.0, 1.0, size=inverter.n_edge)
-    detailed_func[-inverter.n_edge :] = rng.uniform(0.0, 1.0, size=inverter.n_edge)
-    reg = (
-        inverter._regularization(torch.from_numpy(detailed_func)).detach().cpu().numpy()
+    detailed_func[: regularizer.n_edge] = rng.uniform(0.0, 1.0, size=regularizer.n_edge)
+    detailed_func[-regularizer.n_edge :] = rng.uniform(
+        0.0, 1.0, size=regularizer.n_edge
     )
+    reg = regularizer(torch.from_numpy(detailed_func)).detach().cpu().numpy()
+    assert np.isclose(reg, 0.0, atol=1e-5)
+
+    # Test Tikhonov-1 (smoothness, 1st derivatives)
+    regularizer = backward.Tikhonov1()
+    flat_func = np.ones(params.Ndevice)
+    reg = regularizer(torch.from_numpy(flat_func)).detach().cpu().numpy()
+    assert np.isclose(reg, 0.0, atol=1e-5)
+
+    # Test Tikhonov-2 (smoothness, 2nd derivatives)
+    regularizer = backward.Tikhonov2()
+    linear_func = ydevice
+    reg = regularizer(torch.from_numpy(linear_func)).detach().cpu().numpy()
     assert np.isclose(reg, 0.0, atol=1e-5)
 
 

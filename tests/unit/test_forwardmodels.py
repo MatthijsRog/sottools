@@ -522,3 +522,74 @@ def test_cuda_device():
     current2d_y_torch = torch.from_numpy(current2d_y).to("cuda")
     signal2d_torch = forward2d.forward_t(current2d_x_torch, current2d_y_torch)
     assert signal2d_torch.device.type == "cuda"
+
+
+@pytest.mark.parametrize(
+    "phi,gamma", [(0.0, 0.0), (0.4, 0.0), (0.3, 0.5), (-0.6, -0.3)]
+)
+def test_sensor_differentiability_1d(
+    phi: float, gamma: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gradients w.r.t. (height, rho1, rho2, phi_eff) agree with finite differences.
+
+    The kernel is a fixed Gauss-Legendre sum over (alpha, rho) whose radial nodes and
+    weights depend on rho1 and rho2, so autograd must also differentiate through the
+    node positions. The geometry (rho2/h = 1) puts the loop close to the device, where
+    the integrand varies strongly over the loop, and the (phi, gamma) cases exercise
+    every term of the integrand.
+    """
+    monkeypatch.setattr(forward, "DTYPE", torch.float64)
+
+    params = forward.Forward1DParameters(
+        Lscan=10.0,
+        Wdevice=5.0,
+        Nscan=100,
+        phi=phi,
+        gamma=gamma,
+        rho1=0.1,
+        rho2=0.2,
+        height=0.2,
+    )
+    fwd = forward.Forward1D(params)
+
+    rng = np.random.default_rng(0)
+    current = torch.from_numpy(rng.uniform(-5, 5, size=params.Ndevice))
+
+    sensor = torch.tensor(
+        [params.height, params.rho1, params.rho2, params.phi_eff],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    assert torch.autograd.gradcheck(
+        lambda sp: fwd.forward_t(current, sp), (sensor,), eps=1e-6, atol=1e-5, rtol=1e-3
+    )
+
+
+def test_sensor_onthefly_matches_cached_1d(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Passing the parameters' own sensor values reproduces the cached-kernel signal."""
+    monkeypatch.setattr(forward, "DTYPE", torch.float64)
+
+    params = forward.Forward1DParameters(
+        Lscan=10.0,
+        Wdevice=5.0,
+        Nscan=100,
+        phi=0.3,
+        gamma=0.5,
+        rho1=0.1,
+        rho2=0.2,
+        height=0.2,
+        invert_scan=True,
+    )
+    fwd = forward.Forward1D(params)
+
+    rng = np.random.default_rng(0)
+    current = torch.from_numpy(rng.uniform(-5, 5, size=params.Ndevice))
+
+    sensor = torch.tensor(
+        [params.height, params.rho1, params.rho2, params.phi_eff], dtype=torch.float64
+    )
+    s_cached = fwd.forward_t(current)
+    s_onthefly = fwd.forward_t(current, sensor)
+
+    assert torch.allclose(s_cached, s_onthefly, rtol=1e-10, atol=1e-12)

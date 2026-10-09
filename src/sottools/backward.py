@@ -11,6 +11,9 @@ This makes it much easier to incorporate the shape of the sample into the
 inversion.
 """
 
+from __future__ import annotations
+
+import abc
 import dataclasses
 import sys
 import typing
@@ -48,6 +51,8 @@ class FitState1D:
         Current value of the fidelity term in the loss function.
     regularization : float
         Current value of the regularization term in the loss function.
+    regularization_terms : dict[str, float]
+        Dictionary of the individual regularization terms and their values.
     current : np.ndarray
         Current array of size (Ndevice,) representing the current density on
         the device.
@@ -68,6 +73,7 @@ class FitState1D:
     loss: float
     fidelity: float
     regularization: float
+    regularization_terms: dict[str, float]
     current: np.ndarray | None
     predicted_signal: np.ndarray | None
     to_fit_signal: np.ndarray | None
@@ -206,15 +212,190 @@ class JupyterCallback:
         plt.close(self._fig)
 
 
+class Regularizer1D(abc.ABC):
+    """Abstract base class for 1D regularizers.
+
+    Regularizers can be composed and weighed using standard addition and multiplication.
+    """
+
+    __array_ufunc__ = None
+
+    @abc.abstractmethod
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the regularization term for a given current distribution.
+
+        Parameters
+        ----------
+        current : torch.Tensor
+            Current distribution of shape (Ndevice,).
+
+        Returns
+        -------
+        torch.Tensor
+            Regularization term as a scalar tensor.
+        """
+        pass
+
+    def __add__(self, other: Regularizer1D) -> Regularizer1D:
+        """Compose two regularizers by addition."""
+        return SummedRegularizer1D([self, other])
+
+    def __rmul__(self, other: float) -> Regularizer1D:
+        """Scale a regularizer by a scalar weight."""
+        return ScaledRegularizer1D(self, other)
+
+    def terms(self, current: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return regularizer broken down into its constituent terms.
+
+        Parameters
+        ----------
+        current : torch.Tensor
+            Current distribution of shape (Ndevice,).
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping term names to their corresponding regularization values.
+        """
+        return {repr(self): self(current)}
+
+
+class ScaledRegularizer1D(Regularizer1D):
+    """Scaled regularizer that multiplies a regularizer by a scalar weight."""
+
+    def __init__(self, regularizer: Regularizer1D, weight: float):
+        self.regularizer = regularizer
+        self.weight = weight
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the scaled regularization term for a given current distribution."""
+        return self.weight * self.regularizer(current)
+
+    def __repr__(self) -> str:
+        """Return a string representation of the scaled regularizer."""
+        return f"{self.weight:g}*{self.regularizer!r}"
+
+
+class SummedRegularizer1D(Regularizer1D):
+    """Summed regularizer that adds multiple regularizers together."""
+
+    def __init__(self, children: list[Regularizer1D]):
+        self.children = children
+
+        # Flatten any nested SummedRegularizer1D instances
+        flattened_children: list[Regularizer1D] = []
+        for child in self.children:
+            if isinstance(child, SummedRegularizer1D):
+                flattened_children.extend(child.children)
+            else:
+                flattened_children.append(child)
+        self.children = flattened_children
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the summed regularization term for a given current distribution."""
+        return sum(
+            (child(current) for child in self.children),
+            start=torch.tensor(0.0, device=current.device, dtype=current.dtype),
+        )
+
+    def __repr__(self) -> str:
+        """Return a string representation of the summed regularizer."""
+        return " + ".join(repr(child) for child in self.children)
+
+    def terms(self, current: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return regularizer broken down into its constituent terms.
+
+        Parameters
+        ----------
+        current : torch.Tensor
+            Current distribution of shape (Ndevice,).
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping term names to their corresponding regularization values.
+        """
+        result: dict[str, torch.Tensor] = {}
+        for child in self.children:
+            for name, value in child.terms(current).items():
+                result[name] = result.get(name, 0) + value
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
+class TV1(Regularizer1D):
+    """1st order Total Variation regularizer."""
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the 1st order Total Variation regularization term."""
+        return torch.sum(torch.abs(current[1:] - current[:-1]))
+
+
+@dataclasses.dataclass(frozen=True)
+class TV2(Regularizer1D):
+    """2nd order Total Variation regularizer."""
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the 2nd order Total Variation regularization term."""
+        return torch.sum(torch.abs(current[2:] - 2 * current[1:-1] + current[:-2]))
+
+
+@dataclasses.dataclass(frozen=True)
+class Tikhonov1(Regularizer1D):
+    """1st order Tikhonov regularizer: minimizes 2-norm of the derivative."""
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the 1st order Tikhonov regularization term."""
+        return torch.sum((current[1:] - current[:-1]) ** 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class Tikhonov2(Regularizer1D):
+    """2nd order Tikhonov regularizer: minimizes 2-norm of the second derivative."""
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the 2nd order Tikhonov regularization term."""
+        return torch.sum((current[2:] - 2 * current[1:-1] + current[:-2]) ** 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class Positivity(Regularizer1D):
+    """Positivity regularizer."""
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the positivity regularization term."""
+        return torch.sum(torch.relu(-current) ** 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class EdgeRingingSuppression(Regularizer1D):
+    """Edge ringing suppression regularizer.
+
+    Parameters
+    ----------
+    n_edge: int
+        Number of edge elements to consider for suppression. Must be >= 1.
+    """
+
+    n_edge: int
+
+    def __post_init__(self) -> None:
+        if self.n_edge < 1:
+            raise ValueError("n_edge must be >= 1")
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Calculate the edge ringing suppression regularization term."""
+        edges = torch.cat([current[: self.n_edge], current[-self.n_edge :]])
+        return torch.sum(torch.relu(-edges) ** 2)
+
+
 class Inverter1D:
     """Inverts a 1D SOT signal to find the corresponding current distribution.
 
     Uses the Forward1D model in forward.py to relate a 1D SOT scan to a 1D
     current distribution over an infinite bar. Because, especially with noise,
     an infinite number of distributions give rise to (approximately) the same
-    SOT signal, regularizers are used. The current implementation of the class
-    uses TV-1, TV-2, and positivity regularizers. Perhaps, in the future,
-    Tikhonov can be added.
+    SOT signal, regularizers are used.
 
     Parameters
     ----------
@@ -222,17 +403,8 @@ class Inverter1D:
         The forward model to use for the inversion.
     data: np.ndarray
         The SOT signal to fit, of shape (Nscan,).
-    lam1: float
-        Regularization weight for 1st order TV regularization. Default is 0.0.
-    lam2: float
-        Regularization weight for 2nd order TV regularization. Default is 0.0.
-    lam3: float
-        Regularization weight for positivity regularization. Default is 0.0.
-    lam4: float
-        Regularization weight for edge ringing suppression (through further
-        requirement of positivity). Default is 0.0.
-    n_edge: int
-         Number of points on each edge to apply the edge ringing suppression.
+    regularizer: Regularizer1D
+        The regularizer to use for the inversion.
     device: torch.device
         The device to use for the inversion. Default is CPU.
     """
@@ -241,11 +413,7 @@ class Inverter1D:
         self,
         forward: Forward1D,
         data: np.ndarray,
-        lam1: float = 0.0,
-        lam2: float = 0.0,
-        lam3: float = 0.0,
-        lam4: float = 0.0,
-        n_edge: int = 3,
+        regularizer: Regularizer1D,
         device: torch.device | None = None,
     ):
         if device is None:
@@ -253,18 +421,12 @@ class Inverter1D:
 
         self._forward = forward
         self._data = torch.from_numpy(data).to(device, dtype=DTYPE)
-        self._lam1 = lam1  # 1st order TV
-        self._lam2 = lam2  # 2nd order TV
-        self._lam3 = lam3  # Positivity
-        self._lam4 = lam4  # Edge ringing suppression
-        self._n_edge = n_edge  # Edge ringing suppression width
+        self._regularizer = regularizer
         self._device = device
-
-        self._data = self._data.to(self._device)
 
         # Initialize current with zeros
         self._current = torch.zeros(
-            forward.params.Ndevice, requires_grad=True, device=self._device
+            forward.params.Ndevice, requires_grad=True, device=self._device, dtype=DTYPE
         )
 
         # Optimizer pre-defined so that restarts are possible:
@@ -274,40 +436,18 @@ class Inverter1D:
         l2norm: torch.Tensor = torch.linalg.norm(signal - self._data) ** 2
         return l2norm
 
-    def _regularization(self, current: torch.Tensor) -> torch.Tensor:
-        regularizer: torch.Tensor = torch.tensor(0.0, device=current.device)
-
-        # 1st order TV:
-        if self._lam1 > 0.0:
-            tv = torch.sum(torch.abs(current[1:] - current[:-1]))
-            regularizer += self._lam1 * tv
-
-        # 2nd order TV:
-        if self._lam2 > 0.0:
-            tv = torch.sum(torch.abs(current[2:] - 2 * current[1:-1] + current[:-2]))
-            regularizer += self._lam2 * tv
-
-        # Positivity:
-        if self._lam3 > 0.0:
-            positivity_penalty = torch.sum(torch.relu(-current) ** 2)
-            regularizer += self._lam3 * positivity_penalty
-
-        if self._lam4 > 0.0:
-            n = self._n_edge
-            edges = torch.cat([current[:n], current[-n:]])
-            edge_penalty = torch.sum(torch.nn.functional.relu(-edges) ** 2)
-            regularizer += self._lam4 * edge_penalty
-
-        return regularizer
-
     def _objective(
         self, current: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Calculate (objective, fidelity, regularization)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Calculate (objective, fidelity, regularization, regularization_terms)."""
         signal = self._forward.forward_t(current)
         fidelity = self._fidelity(signal)
-        regularization = self._regularization(current)
-        return fidelity + regularization, fidelity, regularization
+        regularizationterms = self._regularizer.terms(current)
+        regularization = sum(
+            regularizationterms.values(),
+            start=torch.tensor(0.0, device=current.device, dtype=current.dtype),
+        )
+        return fidelity + regularization, fidelity, regularization, regularizationterms
 
     def fit(
         self,
@@ -347,11 +487,13 @@ class Inverter1D:
             param_group["lr"] = lr
         optimizer = self._optimizer
 
-        loss_history = torch.zeros(n_steps, device=self._device)
+        loss_history = torch.zeros(n_steps, device=self._device, dtype=DTYPE)
 
         for step in range(n_steps):
             optimizer.zero_grad()
-            loss, fidelity, regularization = self._objective(self._current)
+            loss, fidelity, regularization, regularization_terms = self._objective(
+                self._current
+            )
             loss.backward()  # type: ignore[no-untyped-call]
             optimizer.step()
 
@@ -367,6 +509,9 @@ class Inverter1D:
                     loss=loss.item(),
                     fidelity=fidelity.item(),
                     regularization=regularization.item(),
+                    regularization_terms={
+                        k: v.item() for k, v in regularization_terms.items()
+                    },
                     current=self._current.detach().cpu().numpy().copy(),
                     predicted_signal=signal.cpu().numpy().copy(),
                     to_fit_signal=self._data.detach().cpu().numpy().copy(),
@@ -385,59 +530,22 @@ class Inverter1D:
         return yarray_current, j_recovered, loss_history_recovered
 
     @property
-    def lam1(self) -> float:
-        """Weight of 1st order TV regularization."""
-        return self._lam1
+    def regularizer(self) -> Regularizer1D:
+        """The regularizer used for the inversion."""
+        return self._regularizer
 
-    @lam1.setter
-    def lam1(self, value: float) -> None:
-        """Set the weight of 1st order TV regularization."""
-        self._lam1 = value
-
-    @property
-    def lam2(self) -> float:
-        """Weight of 2nd order TV regularization."""
-        return self._lam2
-
-    @lam2.setter
-    def lam2(self, value: float) -> None:
-        """Set the weight of 2nd order TV regularization."""
-        self._lam2 = value
-
-    @property
-    def lam3(self) -> float:
-        """Weight of positivity regularization."""
-        return self._lam3
-
-    @lam3.setter
-    def lam3(self, value: float) -> None:
-        """Set the weight of positivity regularization."""
-        self._lam3 = value
-
-    @property
-    def lam4(self) -> float:
-        """Weight of edge ringing suppression regularization."""
-        return self._lam4
-
-    @lam4.setter
-    def lam4(self, value: float) -> None:
-        """Set the weight of edge ringing suppression regularization."""
-        self._lam4 = value
-
-    @property
-    def n_edge(self) -> int:
-        """Number of points on each edge to apply the edge ringing suppression."""
-        return self._n_edge
-
-    @n_edge.setter
-    def n_edge(self, value: int) -> None:
-        """Set the number of edge points to apply ringing suppression."""
-        self._n_edge = value
+    @regularizer.setter
+    def regularizer(self, value: Regularizer1D) -> None:
+        """Set the regularizer used for the inversion."""
+        self._regularizer = value
 
     def reset(self) -> None:
         """Reset the inversion to the initial conditions."""
         self._current = torch.zeros(
-            self._forward.params.Ndevice, requires_grad=True, device=self._device
+            self._forward.params.Ndevice,
+            requires_grad=True,
+            device=self._device,
+            dtype=DTYPE,
         )
         self._optimizer = torch.optim.Adam([self._current], lr=1e-3)
 
@@ -462,17 +570,8 @@ class Inverter1DOversampled(Inverter1D):
         The x-axis on which the data is sampled, of shape (Nscan,).
     data: np.ndarray
         The SOT signal to fit, of shape (Nscan,).
-    lam1: float
-        Regularization weight for 1st order TV regularization. Default is 0.0.
-    lam2: float
-        Regularization weight for 2nd order TV regularization. Default is 0.0.
-    lam3: float
-        Regularization weight for positivity regularization. Default is 0.0.
-    lam4: float
-        Regularization weight for edge ringing suppression (through further
-        requirement of positivity). Default is 0.0.
-    n_edge: int
-        Number of points on each edge to apply the edge ringing suppression.
+    regularizer: Regularizer1D
+        The regularizer to use for the inversion.
     device: torch.device
         The device to use for the inversion. Default is CPU.
     """
@@ -482,11 +581,7 @@ class Inverter1DOversampled(Inverter1D):
         forward: Forward1D,
         xdata: np.ndarray,
         data: np.ndarray,
-        lam1: float = 0.0,
-        lam2: float = 0.0,
-        lam3: float = 0.0,
-        lam4: float = 0.0,
-        n_edge: int = 3,
+        regularizer: Regularizer1D,
         device: torch.device | None = None,
     ):
         if device is None:
@@ -510,7 +605,7 @@ class Inverter1DOversampled(Inverter1D):
         self._interp_idx = idx.to(device=device)
         self._interp_t = t.to(device=device)
 
-        super().__init__(forward, data, lam1, lam2, lam3, lam4, n_edge, device)
+        super().__init__(forward, data, regularizer, device)
 
     def _fidelity(self, signal: torch.Tensor) -> torch.Tensor:
         signal_data = signal[self._interp_idx - 1] + self._interp_t * (
@@ -557,11 +652,13 @@ class Inverter1DOversampled(Inverter1D):
             param_group["lr"] = lr
         optimizer = self._optimizer
 
-        loss_history = torch.zeros(n_steps, device=self._device)
+        loss_history = torch.zeros(n_steps, device=self._device, dtype=DTYPE)
 
         for step in range(n_steps):
             optimizer.zero_grad()
-            loss, fidelity, regularization = self._objective(self._current)
+            loss, fidelity, regularization, regularization_terms = self._objective(
+                self._current
+            )
             loss.backward()  # type: ignore[no-untyped-call]
             optimizer.step()
 
@@ -587,6 +684,9 @@ class Inverter1DOversampled(Inverter1D):
                     loss=loss.item(),
                     fidelity=fidelity.item(),
                     regularization=regularization.item(),
+                    regularization_terms={
+                        k: v.item() for k, v in regularization_terms.items()
+                    },
                     current=self._current.detach().cpu().numpy().copy(),
                     predicted_signal=signal_resampled,
                     to_fit_signal=self._data.detach().cpu().numpy().copy(),
@@ -826,8 +926,8 @@ class Inverter2D:
             param_group["lr"] = lr
         optimizer = self._optimizer
 
-        loss_history = torch.zeros(n_steps, device=self._device)
-        fidelity_history = torch.zeros(n_steps, device=self._device)
+        loss_history = torch.zeros(n_steps, device=self._device, dtype=DTYPE)
+        fidelity_history = torch.zeros(n_steps, device=self._device, dtype=DTYPE)
 
         for step in range(n_steps):
             optimizer.zero_grad()
@@ -848,6 +948,10 @@ class Inverter2D:
                     regularization=(
                         self._lam1 * tikhonov_reg + self._lam2 * tv_reg
                     ).item(),
+                    regularization_terms={
+                        "tikhonov": tikhonov_reg.item(),
+                        "tv": tv_reg.item(),
+                    },
                     current=None,
                     predicted_signal=None,
                     to_fit_signal=None,
