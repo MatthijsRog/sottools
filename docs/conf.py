@@ -1,10 +1,9 @@
 project = "sottools"
 author = "Matthijs Rog"
-release = "0.1.1"
+release = "0.1.4"
 
 extensions = [
     "myst_nb",
-    "myst_parser",
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
