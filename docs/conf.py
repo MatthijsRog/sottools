@@ -4,7 +4,7 @@ release = "0.1.1"
 
 extensions = [
     "myst_nb",
-    "myst_parser"
+    "myst_parser",
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
