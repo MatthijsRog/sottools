@@ -471,11 +471,11 @@ class Forward1D:
         kernel_fft: torch.Tensor
             The SQUID response kernel in Fourier space, shape (3*Nscan,)
 
-        Comments
-        --------
+        Notes
+        -----
         Gamma cannot be autodifferentiated because it is connected to ykernel.
-        With the closed-form integral in rho, all computations must be performed in
-        float64 regardless of DTYPE. This is further documented in "kernelmath.md".
+        The rho integral uses Gauss-Legendre quadrature split at rho1 and is
+        evaluated in DTYPE. This is further documented in "kernelmath.md".
         """
         n_alpha = self._n_alpha  # Alpha runs from zero to 2pi non-inclusive
         dalpha = 2 * np.pi / n_alpha

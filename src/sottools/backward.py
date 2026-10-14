@@ -14,10 +14,13 @@ inversion.
 from __future__ import annotations
 
 import abc
+import copy
 import dataclasses
 import sys
+import time
 import typing
-from typing import Protocol
+import warnings
+from typing import Any, Protocol
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -27,9 +30,10 @@ import torch
 
 from sottools.forward import Forward1D, Forward2DCurrent, MeshToGrid
 
-DTYPE = torch.float32
-type _Ax = matplotlib.axes.Axes
 type _Fig = matplotlib.figure.Figure
+type _Ax = matplotlib.axes.Axes
+
+DTYPE = torch.float32
 
 
 @dataclasses.dataclass
@@ -66,6 +70,9 @@ class FitState1D:
         current density.
     xaxis_signal : np.ndarray
         X-axis array of size (Nscan,) representing the positions of the signal.
+    sensor_parameters : np.ndarray, optional
+        Sensor parameters used in the forward model, if applicable. Useful only
+        when performing coinversion. Default is None.
     """
 
     step: int
@@ -79,6 +86,7 @@ class FitState1D:
     to_fit_signal: np.ndarray | None
     xaxis_current: np.ndarray | None
     xaxis_signal: np.ndarray | None
+    sensor_parameters: np.ndarray | None = None
 
 
 class FitCallback(Protocol):
@@ -324,20 +332,26 @@ class SummedRegularizer1D(Regularizer1D):
 
 @dataclasses.dataclass(frozen=True)
 class TV1(Regularizer1D):
-    """1st order Total Variation regularizer."""
+    """1st order Total Variation, Charbonnier-smoothed."""
+
+    eps: float = 1e-3
 
     def __call__(self, current: torch.Tensor) -> torch.Tensor:
         """Calculate the 1st order Total Variation regularization term."""
-        return torch.sum(torch.abs(current[1:] - current[:-1]))
+        d = current[1:] - current[:-1]
+        return torch.sum(torch.sqrt(d**2 + self.eps**2) - self.eps)
 
 
 @dataclasses.dataclass(frozen=True)
 class TV2(Regularizer1D):
-    """2nd order Total Variation regularizer."""
+    """2nd order Total Variation, Charbonnier-smoothed."""
+
+    eps: float = 1e-3
 
     def __call__(self, current: torch.Tensor) -> torch.Tensor:
         """Calculate the 2nd order Total Variation regularization term."""
-        return torch.sum(torch.abs(current[2:] - 2 * current[1:-1] + current[:-2]))
+        d = current[2:] - 2 * current[1:-1] + current[:-2]
+        return torch.sum(torch.sqrt(d**2 + self.eps**2) - self.eps)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -703,6 +717,1017 @@ class Inverter1DOversampled(Inverter1D):
         j_recovered = self._current.detach().cpu().numpy()
         loss_history_recovered = loss_history.cpu().numpy()
         return yarray_current, j_recovered, loss_history_recovered
+
+
+class LearningRateScheduler(abc.ABC):
+    """Abstract base class for a learning rate scheduler to allow annealing."""
+
+    @abc.abstractmethod
+    def __call__(self, step: int) -> float:
+        """Return the learning rate for the given step."""
+        pass
+
+
+class RegularizerScheduler(abc.ABC):
+    """Abstract base class for a regularizer scheduler that enables weight annealing."""
+
+    @abc.abstractmethod
+    def __call__(self, step: int) -> Regularizer1D:
+        """Return the regularizer for the given step."""
+        pass
+
+
+class CoinversionConvergenceChecker:
+    """Live-checks convergence of the coinversion fit.
+
+    Convergence is reached when the following four variables are constant within an
+    absolute tolerance:
+    1) The objective function
+    2) The fidelity function
+    3) The height parameter
+    4) The phi_eff parameter
+
+    The checking is performed over a window "nwindow". In all cases, the value must fall
+    within tolerance over the full window, and the extrapolated value to "nextrapolate"
+    steps must also fall within tolerance. This is to offer the option of filtering out
+    slow drifts. Setting nextrapolate to None disables the extrapolation check. Note
+    that all tolerances are absolute and dimensionful: heighttol is in the length
+    unit of the forward model (micrometers for standard settings) and phitol is in
+    radians. The fidelity and objective are sums (not means) of squared residuals
+    in data units, so fidtol and objtol scale with the squared signal amplitude and
+    with the number of scan points.
+
+    Parameters
+    ----------
+    objtol : float
+        Absolute tolerance for the objective function.
+    fidtol : float
+        Absolute tolerance for the fidelity function.
+    heighttol : float
+        Absolute tolerance for the height parameter.
+    phitol : float
+        Absolute tolerance for the phi_eff parameter.
+    nwindow : int
+        Number of steps to consider for convergence checking.
+    nextrapolate : int | None
+        Number of steps to extrapolate for convergence checking. If None, no
+        extrapolation check is performed.
+
+    Notes
+    -----
+    For most real data, the default absolute tolerances are too strict.
+    """
+
+    def __init__(
+        self,
+        objtol: float = 1e-7,
+        fidtol: float = 1e-7,
+        heighttol: float = 1e-4,
+        phitol: float = 1e-4,
+        nwindow: int = 10,
+        nextrapolate: int | None = 100,
+    ):
+        self.objtol = objtol
+        self.fidtol = fidtol
+        self.heighttol = heighttol
+        self.phitol = phitol
+        self.nwindow = nwindow
+        self.nextrapolate = nextrapolate
+
+    def check(self, fithistory: CoinversionFitHistory) -> bool:
+        """Check if convergence has been reached.
+
+        Parameters
+        ----------
+        fithistory : CoinversionFitHistory
+            The history of the coinversion fit.
+        """
+        fidelityhistory = fithistory.fidelity_history
+        objectivehistory = fithistory.objective_history
+        heighthistory = fithistory.height_history
+        phihistory = fithistory.phi_history
+
+        length = len(fidelityhistory)
+        if length < self.nwindow:
+            return False  # Not enough history to check convergence
+        else:
+            fidhist = np.array(fidelityhistory[-self.nwindow :])
+            objhist = np.array(objectivehistory[-self.nwindow :])
+            heighthist = np.array(heighthistory[-self.nwindow :])
+            phihist = np.array(phihistory[-self.nwindow :])
+
+            # Check if the values are within tolerance
+            fid_converged = (np.max(fidhist) - np.min(fidhist)) < self.fidtol
+            obj_converged = (np.max(objhist) - np.min(objhist)) < self.objtol
+            height_converged = (
+                np.max(heighthist) - np.min(heighthist)
+            ) < self.heighttol
+            phi_converged = (np.max(phihist) - np.min(phihist)) < self.phitol
+
+            if not (
+                fid_converged and obj_converged and height_converged and phi_converged
+            ):
+                return False
+
+            # Now check the extrapolated value through a linear extrapolation for
+            # another nextrapolate steps
+            if self.nextrapolate is None:
+                return True  # No extrapolation check requested
+            x = np.arange(self.nwindow)
+            fid_fit = np.polyfit(x, fidhist, 1)
+            obj_fit = np.polyfit(x, objhist, 1)
+            height_fit = np.polyfit(x, heighthist, 1)
+            phi_fit = np.polyfit(x, phihist, 1)
+            fid_extrap_value = np.polyval(fid_fit, self.nwindow + self.nextrapolate)
+            obj_extrap_value = np.polyval(obj_fit, self.nwindow + self.nextrapolate)
+            height_extrap_value = np.polyval(
+                height_fit, self.nwindow + self.nextrapolate
+            )
+            phi_extrap_value = np.polyval(phi_fit, self.nwindow + self.nextrapolate)
+            fid_converged = abs(fid_extrap_value - fidhist[-1]) < self.fidtol
+            obj_converged = abs(obj_extrap_value - objhist[-1]) < self.objtol
+            height_converged = (
+                abs(height_extrap_value - heighthist[-1]) < self.heighttol
+            )
+            phi_converged = abs(phi_extrap_value - phihist[-1]) < self.phitol
+
+            return bool(
+                fid_converged and obj_converged and height_converged and phi_converged
+            )
+
+
+@dataclasses.dataclass
+class CoinversionFitHistory:
+    """Stores the history of the coinversion fit.
+
+    For crossvalidation_size > 1, fidelity is the summed test-set fidelity (the CV
+    score) and objective is the summed training objective of all folds; hence objective
+    - fidelity is not equal to regularization.
+
+    Parameters
+    ----------
+    fidelity_history : list[float]
+        History of the fidelity function.
+    regularization_terms_history : list[dict[str, float]]
+        History of regularization, split into its individual terms.
+    regularization_history : list[float]
+        History of the total regularization.
+    objective_history : list[float]
+        History of the objective function.
+    height_history : list[float]
+        History of the height parameter.
+    phi_history : list[float]
+        History of the phi_eff parameter.
+    """
+
+    fidelity_history: list[float] = dataclasses.field(default_factory=list)
+    regularization_terms_history: list[dict[str, float]] = dataclasses.field(
+        default_factory=list
+    )
+    regularization_history: list[float] = dataclasses.field(default_factory=list)
+    objective_history: list[float] = dataclasses.field(default_factory=list)
+    height_history: list[float] = dataclasses.field(default_factory=list)
+    phi_history: list[float] = dataclasses.field(default_factory=list)
+
+    def append(
+        self,
+        fidelity: float,
+        regularization_terms: dict[str, float],
+        regularization: float,
+        objective: float,
+        height: float,
+        phi: float,
+    ) -> None:
+        """Append a new entry to the history.
+
+        Parameters
+        ----------
+        fidelity : float
+            The fidelity function value.
+        regularization_terms : dict[str, float]
+            The individual regularization terms in a dictionary.
+        regularization : float
+            The total regularization value.
+        objective : float
+            The objective function value.
+        height : float
+            The height parameter value.
+        phi : float
+            The phi_eff parameter value.
+        """
+        self.fidelity_history.append(fidelity)
+        self.regularization_terms_history.append(regularization_terms)
+        self.regularization_history.append(regularization)
+        self.objective_history.append(objective)
+        self.height_history.append(height)
+        self.phi_history.append(phi)
+
+
+class Coinversion1D:
+    """Inverter for co-fitting the sensor parameters height and phi_eff.
+
+    Standard inversion simply minimizes the objective function, which consists of
+    fidelity and regularization. Co-inversion of current and kernel parameters is much
+    more complex, because there are various spurious attractors that give poor fits.
+    If the kernel parameters are directly optimized alongside the current, kernels that
+    allow for better-regularized currents will be preferred. For this reason, the
+    problem is approached in a bilevel scheme. Moreover, in presence of noise, narrower
+    kernels are preferred because they allow for overfitting. For this reason,
+    a cross validation scheme can be used (by setting crossvalidation_size > 1).
+
+    Parameters
+    ----------
+    forward : Forward1D
+        The forward model to use for the inversion. A copy is made, such that the
+        underlying parameter object can be modified. However, the parameter object
+        is modified only if cache_kernels is True. The height and phi stored in
+        forward.params are ignored as starting values; use initial_height and
+        initial_phi_eff instead.
+    data : np.ndarray
+        The data to fit, of shape (Nscan,).
+    regularizer: Regularizer1D | RegularizerScheduler
+        The regularizer to use for the inversion. If a RegularizerScheduler is provided,
+        the regularizer is updated at each sensor optimization step. Regularizers are
+        deep-copied into the class and therefore disjoint from any externally kept
+        reference.
+    initial_height : float, optional
+        The initial height parameter value. Default is 1.0.
+    initial_phi_eff : float, optional
+        The initial effective tilt angle in radians. Default is 0.0. This is the
+        scan-frame angle Forward1DParameters.phi_eff, i.e. -phi if
+        forward.params.invert_scan is True, and +phi otherwise.
+    crossvalidation_size : int, optional
+        The number of cross-validation splits. Default is 1. If larger than 1,
+        cross-validation is used to prevent overfitting.
+    convergence_checker : CoinversionConvergenceChecker | None, optional
+        The convergence checker to use. Default is None.
+    callback : FitCallback | None, optional
+        The callback to use during fitting. Default is None.
+    callback_every : int, optional
+        Call callback.on_step every callback_every sensor optimization steps.
+        Default is 1.
+    device : torch.device | None, optional
+        The device to use for computations. Default is None.
+    lr_sensor : float | LearningRateScheduler, optional
+        The learning rate for sensor parameters. Default is 1e-2. Learning rate
+        schedulers are deep-copied and therefore disjoint from any externally kept
+        reference.
+    lr_current : float | LearningRateScheduler, optional
+        The learning rate for current parameters. Default is 1.0. Learning rate
+        schedulers are deep-copied and therefore disjoint from any externally kept
+        reference.
+    cache_kernels : bool, optional
+        Whether to cache kernels. Default is True.
+    verbose : bool, optional
+        Whether to print verbose output. Default is False.
+
+    Notes
+    -----
+    These parameters have the constraint that height > rho2*|sin(phi_eff)| such
+    that the SQUID never crosses the sample plane. To incorporate this constraint, we
+    reparametrize the height parameter as h_free and write h = exp(h_free) + rho2*
+    |sin(phi_eff)|. The free parameter h_free is then optimized, and the constraint is
+    automatically satisfied.
+
+    crossvalidation_size: if >1, data is split into crossvalidation_size parts and
+    training+test seperation is used to prevent overfitting. See documentation for
+    further information.
+
+    Callback behaviour: in on_step, FitState1D.current is the current of fold 0
+    (fitted on the training set of fold 0 only), and predicted_signal is its
+    prediction on the full scan, so held-out points are included. on_step is not
+    called on the step at which convergence is detected. on_finish receives the
+    final current, fitted on the full dataset, and its prediction.
+
+    All angles, including the fitted sensor_parameters[3] and history.phi_history,
+    are phi_eff in radians (see initial_phi_eff).
+    """
+
+    LBFGS_MAXREPEATS = 10
+    LBFGS_TOLERANCE_GRAD = 1e-6
+    LBFGS_TOLERANCE_ABS = 1e-10
+
+    def __init__(
+        self,
+        forward: Forward1D,
+        data: np.ndarray,
+        regularizer: Regularizer1D | RegularizerScheduler,
+        initial_height: float = 1.0,
+        initial_phi_eff: float = 0.0,
+        crossvalidation_size: int = 1,
+        convergence_checker: CoinversionConvergenceChecker | None = None,
+        callback: FitCallback | None = None,
+        callback_every: int = 1,
+        device: torch.device | None = None,
+        lr_sensor: float | LearningRateScheduler = 1e-2,
+        lr_current: float | LearningRateScheduler = 1.0,
+        cache_kernels: bool = True,
+        verbose: bool = False,
+    ):
+        if device is None:
+            device = torch.device("cpu")
+
+        self._forward = copy.deepcopy(forward)
+        self._initial_forward = copy.deepcopy(forward)
+        self._data = torch.from_numpy(data).to(device, dtype=DTYPE)
+        self._regularizer = regularizer
+        self._regularizer_initial = copy.deepcopy(regularizer)
+        self._crossvalidation_size = crossvalidation_size
+        self._convergence_checker = convergence_checker
+        self._callback = callback
+        self._callback_every = callback_every
+        self._device = device
+        self._fitted_current: np.ndarray | None = None
+        self._cache_kernels = cache_kernels
+        self._verbose = verbose
+
+        self._folds = self._build_folds()
+
+        self._lr_current = lr_current
+        self._lr_current_initial = lr_current
+        self._lr_sensor = lr_sensor
+        self._lr_sensor_initial = lr_sensor
+        self._initial_phi_eff = initial_phi_eff
+        initial_relative_height = initial_height - self._forward.params.rho2 * np.abs(
+            np.sin(initial_phi_eff)
+        )
+        if initial_relative_height <= 0:
+            raise ValueError(
+                f"Initial height {initial_height} is too small for the "
+                f"given phi_eff {initial_phi_eff} and rho2 "
+                f"{self._forward.params.rho2}. Must satisfy height > rho2 "
+                f"* |sin(phi_eff)|."
+            )
+        self._initial_height_free = np.log(initial_relative_height)
+
+        self.reset()
+
+    def _build_folds(self) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Build the (training, test) boolean masks for every cross-validation fold.
+
+        Fold i leaves out every K-th scan point starting at index i; those points form
+        the test set, the rest the training set. Each scan point is in exactly one
+        test set. K=1 is the full fit: training and test are both the entire scan.
+        """
+        n_points = self._data.shape[0]
+        k = self._crossvalidation_size
+        folds = []
+        for i in range(k):
+            training = torch.ones(n_points, dtype=torch.bool, device=self._device)
+            if k == 1:
+                test = training.clone()
+            else:
+                training[i::k] = False
+                test = ~training
+            folds.append((training, test))
+        return tuple(folds)
+
+    def _full_sensor_parameters(self, free_parameters: torch.Tensor) -> torch.Tensor:
+        # Assemble the full sensor parameters tensor from the free parameters
+        return torch.stack(
+            [
+                torch.exp(free_parameters[0])
+                + self._forward.params.rho2 * torch.abs(torch.sin(free_parameters[1])),
+                torch.tensor(
+                    self._forward.params.rho1, device=self._device, dtype=DTYPE
+                ),
+                torch.tensor(
+                    self._forward.params.rho2, device=self._device, dtype=DTYPE
+                ),
+                free_parameters[1],
+            ]
+        )
+
+    def _fidelity(
+        self,
+        current: torch.Tensor,
+        full_sensor_parameters: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        use_cached_kernels: bool = False,
+    ) -> torch.Tensor:
+        signal = self._forward.forward_t(
+            current, full_sensor_parameters if not use_cached_kernels else None
+        )
+        if mask is not None:
+            signal = signal[mask]
+            data = self._data[mask]
+        else:
+            data = self._data
+        residual_norm: torch.Tensor = torch.linalg.norm(signal - data)
+        return residual_norm.pow(2)
+
+    def _objective(
+        self,
+        current: torch.Tensor,
+        sensor_parameters_free: torch.Tensor,
+        regularizer: Regularizer1D,
+        mask: torch.Tensor | None = None,
+        use_cached_kernels: bool = False,  # If True, cached kernels get used, however,
+        # this can only work if the sensor parameters are static.
+    ) -> torch.Tensor:
+        full_sensor_parameters = self._full_sensor_parameters(sensor_parameters_free)
+        fidelity = self._fidelity(
+            current, full_sensor_parameters, mask, use_cached_kernels=use_cached_kernels
+        )
+        reg = regularizer(current)
+        return fidelity + reg
+
+    def _all_loss_terms(
+        self,
+        currents: list[torch.Tensor],
+        sensor_parameters_free: torch.Tensor,
+        regularizer: Regularizer1D,
+    ) -> tuple[float, dict[str, float], float, float]:
+        # Per fold f with current c_f:
+        #   fidelity  = sum_f F_test,f(c_f)              (CV score, the outer criterion)
+        #   reg       = sum_f R(c_f)
+        #   objective = sum_f [F_train,f(c_f) + R(c_f)]  (summed inner objectives)
+        # At K=1 (train = test = all) these reduce to F, R and F + R.
+        sensor_params = self._full_sensor_parameters(sensor_parameters_free.detach())
+        fidelity = 0.0
+        train_fidelity = 0.0
+        regterms: dict[str, float] = {}
+        for current, (training_set_mask, test_set_mask) in zip(
+            currents, self._folds, strict=True
+        ):
+            c = current.detach()
+            fidelity += self._fidelity(c, sensor_params, test_set_mask).item()
+            train_fidelity += self._fidelity(c, sensor_params, training_set_mask).item()
+            for name, value in regularizer.terms(c).items():
+                regterms[name] = regterms.get(name, 0.0) + value.item()
+        reg = sum(regterms.values())
+        obj = train_fidelity + reg
+        return fidelity, regterms, reg, obj
+
+    def _make_fit_state(
+        self, regularizer: Regularizer1D, total_steps: int
+    ) -> FitState1D:
+        fidelity, regterms, reg, obj = self._all_loss_terms(
+            self._currents, self._sensor_parameters_free, regularizer
+        )
+        return FitState1D(
+            step=self._parameter_optimizer_step,
+            total_steps=total_steps,
+            loss=obj,
+            fidelity=fidelity,
+            regularization=reg,
+            regularization_terms=regterms,
+            current=self._fitted_current,
+            predicted_signal=self.prediction,
+            to_fit_signal=self.data,
+            xaxis_current=self.ydevice,
+            xaxis_signal=self.yscan,
+            sensor_parameters=self.sensor_parameters,
+        )
+
+    def _get_regularizer(self, parameter_optimizer_step: int) -> Regularizer1D:
+        return (
+            self._regularizer(parameter_optimizer_step)
+            if isinstance(self._regularizer, RegularizerScheduler)
+            else self._regularizer
+        )
+
+    def fit(
+        self,
+        n_steps_sensor: int = 500,
+        n_steps_current: int = 200,
+    ) -> dict[str, Any]:
+        """Perform or continue a full co-inversion of the dataset.
+
+        If the fit has not been started, fits until convergence is reached, or until
+        n_steps_sensor sensor optimization steps have been performed. If the fit has
+        already been started (and reset() has not been called), continues where was
+        left off.
+
+        Parameters
+        ----------
+        n_steps_sensor : int, optional
+            The number of sensor optimization steps to perform. Default is 500.
+        n_steps_current : int, optional
+            The number of current optimization steps to perform for each sensor
+            optimization step. Default is 200.
+
+        Returns
+        -------
+        dict[str, Any]
+            A short fit report, containing the following keys:
+            - "message" (str): A message indicating the reason for stopping the fit.
+            - "steps" (int): The number of sensor optimization steps performed.
+            - "steps_total" (int): The total number of sensor optimization steps
+              performed since the last reset.
+            - "final_sensor_parameters" (np.ndarray): The final sensor parameters after
+              the fit, of shape (4,).
+        """
+        optimize_current_times = []
+        calculate_v_times = []
+        optimize_sensor_times = []
+        history_times = []
+
+        n_steps_start = self._parameter_optimizer_step
+
+        did_converge = False
+
+        while self._parameter_optimizer_step - n_steps_start < n_steps_sensor:
+            # Update learning rate for the sensor based on the scheduler.
+            lr_sensor = self._get_lr_sensor(self._parameter_optimizer_step)
+            lr_current = self._get_lr_current(self._parameter_optimizer_step)
+            regularizer = self._get_regularizer(self._parameter_optimizer_step)
+
+            self._parameter_optimizer.param_groups[0]["lr"] = lr_sensor
+
+            # Step 1: for each training set, optimize the current with sensor parameters
+            # fixed.
+            start_time = time.perf_counter()
+            if self._cache_kernels:
+                self._cache_kernels_into_forward(
+                    self._sensor_parameters_free, self._forward
+                )
+            self._optimize_currents_fixed_sensor(
+                self._currents,
+                self._sensor_parameters_free,
+                n_steps_current,
+                lr_current,
+                regularizer,
+            )
+            optimize_current_times.append(time.perf_counter() - start_time)
+            start_time = time.perf_counter()
+            vs = self._calculate_vs_at_fixed_point(
+                self._currents, self._sensor_parameters_free, regularizer
+            )
+            calculate_v_times.append(time.perf_counter() - start_time)
+
+            # Now we record the history:
+            start_time = time.perf_counter()
+            fidelity, regterms, reg, obj = self._all_loss_terms(
+                self._currents, self._sensor_parameters_free, regularizer
+            )
+            sp = self._full_sensor_parameters(self._sensor_parameters_free.detach())
+            height, phi_eff = sp[0].item(), sp[3].item()
+            self._history.append(fidelity, regterms, reg, obj, height, phi_eff)
+
+            do_callback = self._callback is not None and (
+                (self._parameter_optimizer_step + 1) % self._callback_every == 0
+            )
+            if do_callback:
+                # Sensor parameters are not yet updated in this step, so the cached
+                # kernel (if any) still matches sp: one cheap FFT convolution.
+                with torch.no_grad():
+                    prediction_fold0 = self._forward.forward_t(
+                        self._currents[0].detach(),
+                        None if self._cache_kernels else sp,
+                    )
+                state = FitState1D(
+                    step=self._parameter_optimizer_step,
+                    total_steps=n_steps_start + n_steps_sensor,
+                    loss=obj,
+                    fidelity=fidelity,
+                    regularization=reg,
+                    regularization_terms=regterms,
+                    current=self._currents[0].detach().cpu().numpy(),
+                    predicted_signal=prediction_fold0.cpu().numpy(),
+                    to_fit_signal=self.data,
+                    xaxis_current=self.ydevice,
+                    xaxis_signal=self.yscan,
+                    sensor_parameters=sp.cpu().numpy(),
+                )
+            history_times.append(time.perf_counter() - start_time)
+
+            start_time = time.perf_counter()
+            self._optimize_sensor_fixed_current(
+                self._currents,
+                self._sensor_parameters_free,
+                self._parameter_optimizer,
+                vs,
+                regularizer,
+            )
+            optimize_sensor_times.append(time.perf_counter() - start_time)
+
+            self._parameter_optimizer_step += 1
+
+            # Check for convergence if a checker is provided
+            if self._convergence_checker is not None:
+                if self._convergence_checker.check(self._history):
+                    if self._verbose:
+                        print(
+                            f"Convergence reached at sensor optimization step "
+                            f"{self._parameter_optimizer_step}."
+                        )
+                    did_converge = True
+                    break
+
+            # Perform live callback
+            if do_callback:
+                assert self._callback is not None
+                self._callback.on_step(state)
+
+        # Now that we are done, we have the proper fixed parameters to calculate the
+        # current one last time. Soft start from the average current:
+        if self._cache_kernels:
+            self._cache_kernels_into_forward(
+                self._sensor_parameters_free, self._forward
+            )
+        current = (
+            torch.mean(torch.stack(self._currents), dim=0).detach().requires_grad_(True)
+        )
+        full_data_mask = torch.ones(
+            self._data.shape[0], dtype=torch.bool, device=self._device
+        )
+        self._optimize_single_current_fixed_sensor(
+            current,
+            self._sensor_parameters_free,
+            n_steps_current,
+            self._get_lr_current(self._parameter_optimizer_step),
+            self._get_regularizer(self._parameter_optimizer_step),
+            full_data_mask,
+        )
+        self._fitted_current = np.copy(current.detach().cpu().numpy())
+
+        # We are done, so call the finish callback if provided
+        if self._callback is not None:
+            shift = -1 if self._parameter_optimizer_step > 0 else 0
+            state = self._make_fit_state(
+                self._get_regularizer(self._parameter_optimizer_step + shift),
+                total_steps=n_steps_start + n_steps_sensor,
+            )
+            self._callback.on_finish(state)
+
+        # Summarize timings
+        if self._verbose and optimize_current_times:
+            print("FIT FINISHED --- TIMING SUMMARY")
+            print(
+                f"CURRENT DETERMINATION --- \tAverage: {
+                    np.mean(optimize_current_times):.4f} s\t"
+                f"Max: {np.max(optimize_current_times):.4f} s\t"
+                f"Min: {np.min(optimize_current_times):.4f}\t"
+                f"Total: {np.sum(optimize_current_times):.4f} s"
+            )
+            print(
+                f"V CALCULATION --- \tAverage: {np.mean(calculate_v_times):.4f} s\t"
+                f"Max: {np.max(calculate_v_times):.4f} s\t"
+                f"Min: {np.min(calculate_v_times):.4f}\t"
+                f"Total: {np.sum(calculate_v_times):.4f} s"
+            )
+            print(
+                f"SENSOR DETERMINATION --- \tAverage: {
+                    np.mean(optimize_sensor_times):.4f} s\t"
+                f"Max: {np.max(optimize_sensor_times):.4f} s\t"
+                f"Min: {np.min(optimize_sensor_times):.4f}\t"
+                f"Total: {np.sum(optimize_sensor_times):.4f} s"
+            )
+            print(
+                f"HISTORY RECORDING --- \t\tAverage: {np.mean(history_times):.4f} s\t"
+                f"Max: {np.max(history_times):.4f} s\t"
+                f"Min: {np.min(history_times):.4f}\t"
+                f"Total: {np.sum(history_times):.4f} s"
+            )
+
+        # At the end, return a small dictionary reporting the final state
+        final_sensor_params = self.sensor_parameters
+        nsteps = self._parameter_optimizer_step - n_steps_start
+        stopreason = "converged" if did_converge else "max_steps_reached"
+        return {
+            "message": stopreason,
+            "steps": nsteps,
+            "steps_total": self._parameter_optimizer_step,
+            "final_sensor_parameters": final_sensor_params,
+        }
+
+    def _optimize_sensor_fixed_current(
+        self,
+        currents: list[torch.Tensor],
+        sensor_parameters_free: torch.Tensor,
+        parameter_optimizer: torch.optim.Optimizer,
+        vs: list[torch.Tensor],
+        regularizer: Regularizer1D,
+    ) -> None:
+        # Without CV, one calculates the surrogate F - Lcurr * v
+        # With CV, one has as many vs as folds, and as many surrogates as folds
+        # One then calculates for the ith surrogate F - Lcurr * v using:
+        # - for F, the test set i
+        # - for Lcurr, the training set i
+        # - the ith calculated v (which comes from test set i)
+        surrogates = []
+        sensorparams = self._full_sensor_parameters(sensor_parameters_free)
+        for i in range(self._crossvalidation_size):
+            training_set_mask, test_set_mask = self._folds[i]
+            curr = currents[i].clone().detach().requires_grad_(True)  # Something to
+            # take derivatives with respect to.
+            F_test = self._fidelity(curr, sensorparams, test_set_mask)
+            F_train = self._fidelity(curr, sensorparams, training_set_mask)
+            Lcurr = torch.autograd.grad(
+                F_train + regularizer(curr), curr, create_graph=True
+            )[0]
+            surrogate = F_test - (Lcurr * vs[i]).sum()
+            surrogates.append(surrogate)
+        composite_surrogate: torch.Tensor = torch.stack(surrogates).sum()
+        parameter_optimizer.zero_grad()
+        composite_surrogate.backward(inputs=sensor_parameters_free)  # type: ignore[no-untyped-call]
+        parameter_optimizer.step()
+
+    def _calculate_vs_at_fixed_point(
+        self,
+        currents: list[torch.Tensor],
+        sensor_parameters_free: torch.Tensor,
+        regularizer: Regularizer1D,
+    ) -> list[torch.Tensor]:
+        # Calculates the "v" object at a fixed point in the optimization scheme. Final
+        # v is detached from the graph. Each fold gets its own "v" object (we return a
+        # list). Where v is calculated using only the TEST SET
+        vs = []
+        for i in range(self._crossvalidation_size):
+            training_set_mask, test_set_mask = self._folds[i]
+            v = self._calculate_single_v_at_fixed_point(
+                currents[i],
+                sensor_parameters_free,
+                regularizer,
+                training_set_mask,
+                test_set_mask,
+            )
+            vs.append(v)
+        return vs
+
+    def _calculate_single_v_at_fixed_point(
+        self,
+        current: torch.Tensor,
+        sensor_parameters_free: torch.Tensor,
+        regularizer: Regularizer1D,
+        training_set_mask: torch.Tensor,
+        test_set_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Calculates the "v" object at a fixed point in the optimization scheme.
+        # Final v is detached from the graph.
+        # Where v is calculated using only the TEST SET
+        current_fixed = current.detach()
+        sensor_params_fixed = self._full_sensor_parameters(
+            sensor_parameters_free
+        ).detach()
+        curr = current_fixed.clone().requires_grad_(True)  # Something to take
+        # derivatives with respect to.
+        fcurr = torch.autograd.grad(
+            self._fidelity(curr, sensor_params_fixed, test_set_mask), curr
+        )[0]
+        hessian = torch.autograd.functional.hessian(
+            lambda c: (
+                self._fidelity(c, sensor_params_fixed, training_set_mask)
+                + regularizer(c)
+            ),
+            curr,
+            vectorize=True,
+        )  # type: ignore[no-untyped-call]
+        v: torch.Tensor = (
+            torch.linalg.solve(hessian.double(), fcurr.double()).to(DTYPE).detach()
+        )
+        return v
+
+    def _optimize_currents_fixed_sensor(
+        self,
+        currents: list[torch.Tensor],
+        sensor_parameters_free: torch.Tensor,
+        n_steps_current: int,
+        lr_current: float,
+        regularizer: Regularizer1D,
+    ) -> None:
+        for i in range(self._crossvalidation_size):
+            training_set_mask, _ = self._folds[i]
+            self._optimize_single_current_fixed_sensor(
+                currents[i],
+                sensor_parameters_free,
+                n_steps_current,
+                lr_current,
+                regularizer,
+                training_set_mask,
+            )
+
+    def _cache_kernels_into_forward(
+        self, sensor_parameters_free: torch.Tensor, forward: Forward1D
+    ) -> None:
+        params = copy.deepcopy(forward.params)
+        full_params = self._full_sensor_parameters(sensor_parameters_free.detach())
+        h, phi_eff = full_params[0].item(), full_params[3].item()
+        params.height = h
+        params.phi = phi_eff if not params.invert_scan else -phi_eff
+        forward.params = params  # This automatically caches, .params is a @property.
+
+    def _optimize_single_current_fixed_sensor(
+        self,
+        current: torch.Tensor,
+        sensor_parameters_free: torch.Tensor,
+        n_steps_current: int,
+        lr_current: float,
+        regularizer: Regularizer1D,
+        training_set_mask: torch.Tensor | None = None,
+    ) -> None:
+        # Current must be leaf tensor with requires_grad=True
+        free_sensor_params_fixed = sensor_parameters_free.detach()
+        current_optimizer = torch.optim.LBFGS(
+            [current],
+            lr=lr_current,
+            max_iter=n_steps_current,
+            max_eval=n_steps_current * 5,
+            tolerance_grad=self.LBFGS_TOLERANCE_GRAD,
+            tolerance_change=self.LBFGS_TOLERANCE_ABS,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure() -> torch.Tensor:
+            current_optimizer.zero_grad()
+            loss = self._objective(
+                current,
+                free_sensor_params_fixed,
+                regularizer,
+                training_set_mask,
+                use_cached_kernels=self._cache_kernels,
+            )
+            loss.backward()  # type: ignore[no-untyped-call]
+            return loss
+
+        # As long as max_steps is reached, continue, to ensure we end up converged
+        st = current_optimizer.state[current]
+        n_before = 0  # fresh optimizer
+        current_optimizer.step(closure)  # type: ignore[no-untyped-call]
+        nrepeats = 1
+        while st["n_iter"] - n_before == n_steps_current:
+            n_before = st["n_iter"]
+            current_optimizer.step(closure)  # type: ignore[no-untyped-call]
+            nrepeats += 1
+            if nrepeats > self.LBFGS_MAXREPEATS:
+                warnings.warn(
+                    "LBFGS did not converge within the maximum number of repeats. "
+                    "Consider increasing n_steps_current or adjusting lr_current. "
+                    "Alternatively, perhaps the tolerance is set too strictly.",
+                    stacklevel=2,
+                )
+                break
+
+    def _get_lr_sensor(self, parameter_optimizer_step: int) -> float:
+        lr_sensor = (
+            self._lr_sensor(parameter_optimizer_step)
+            if isinstance(self._lr_sensor, LearningRateScheduler)
+            else self._lr_sensor
+        )
+        return lr_sensor
+
+    def _get_lr_current(self, parameter_optimizer_step: int) -> float:
+        lr_current = (
+            self._lr_current(parameter_optimizer_step)
+            if isinstance(self._lr_current, LearningRateScheduler)
+            else self._lr_current
+        )
+        return lr_current
+
+    def reset(self) -> None:
+        """Reset the state of the fit to return to the initial state.
+
+        Performs a true "factory reset" as if fit() was never run.
+        """
+        self._parameter_optimizer_step = 0
+        self._forward = copy.deepcopy(self._initial_forward)
+
+        self._lr_current = self._lr_current_initial
+        self._regularizer = copy.deepcopy(self._regularizer_initial)
+
+        self._currents = [
+            torch.zeros(
+                self._forward.params.Ndevice,
+                requires_grad=True,
+                device=self._device,
+                dtype=DTYPE,
+            )
+            for _ in range(self._crossvalidation_size)
+        ]  # List of currents, one predicted
+        # by each training set. The final prediction should be made by using the final
+        # kernel and fitting on a training set spanning the entire data set.
+        self._fitted_current = None
+
+        # Initialize the free sensor parameters (height and phi_eff) with the provided
+        # initial values
+        self._sensor_parameters_free = torch.tensor(
+            [self._initial_height_free, self._initial_phi_eff],
+            requires_grad=True,
+            device=self._device,
+            dtype=DTYPE,
+        )
+        self._lr_sensor = self._lr_sensor_initial
+        lr_sensor = self._get_lr_sensor(
+            self._parameter_optimizer_step
+        )  # Should be 0 :)
+        self._parameter_optimizer = torch.optim.Adam(
+            [self._sensor_parameters_free], lr=lr_sensor
+        )
+
+        self._history = CoinversionFitHistory()
+
+    @property
+    def lr_sensor(self) -> float | LearningRateScheduler:
+        """The learning rate for the sensor parameters, potentially a scheduler."""
+        return self._lr_sensor
+
+    @lr_sensor.setter
+    def lr_sensor(self, value: float | LearningRateScheduler) -> None:
+        # Setting the learning rate to a float when a scheduler is provided
+        # should raise. However, changing the scheduler mid-run is allowed.
+        if isinstance(self._lr_sensor, LearningRateScheduler) and (
+            not isinstance(value, LearningRateScheduler)
+        ):
+            raise ValueError(
+                "Cannot set lr_sensor to a float when a "
+                "LearningRateScheduler is in use. Use a scheduler or set "
+                "the initial learning rate to a float."
+            )
+        self._lr_sensor = value
+
+    @property
+    def lr_current(self) -> float | LearningRateScheduler:
+        """The learning rate for the current optimization, potentially a scheduler."""
+        return self._lr_current
+
+    @lr_current.setter
+    def lr_current(self, value: float | LearningRateScheduler) -> None:
+        if isinstance(self._lr_current, LearningRateScheduler) and (
+            not isinstance(value, LearningRateScheduler)
+        ):
+            raise ValueError(
+                "Cannot set lr_current to a float when a "
+                "LearningRateScheduler is in use. Use a scheduler or set "
+                "the initial learning rate to a float."
+            )
+        self._lr_current = value
+
+    @property
+    def regularizer(self) -> Regularizer1D | RegularizerScheduler:
+        """The regularizer used for regularization, either a function or scheduler."""
+        return self._regularizer
+
+    @regularizer.setter
+    def regularizer(self, value: Regularizer1D | RegularizerScheduler) -> None:
+        # Setting the regularizer to a Regularizer1D when a RegularizerScheduler is
+        # provided should raise. However, changing the scheduler mid-run is allowed.
+        if isinstance(self._regularizer, RegularizerScheduler) and (
+            not isinstance(value, RegularizerScheduler)
+        ):
+            raise ValueError(
+                "Cannot set regularizer to a Regularizer1D when a "
+                "RegularizerScheduler is in use. Use a scheduler or set "
+                "the initial regularizer to a Regularizer1D."
+            )
+        self._regularizer = value
+
+    @property
+    def history(self) -> CoinversionFitHistory:
+        """The history of the fit."""
+        return self._history
+
+    @property
+    def sensor_parameters(self) -> np.ndarray:
+        """The fitted sensor parameters (height, rho1, rho2, phi_eff)."""
+        sps = self._full_sensor_parameters(self._sensor_parameters_free)
+        return np.copy(sps.detach().cpu().numpy())
+
+    @property
+    def ydevice(self) -> np.ndarray:
+        """Axis over which the current profile is defined (the device axis)."""
+        return np.copy(self._forward.params.ydevice.detach().cpu().numpy())
+
+    @property
+    def current(self) -> np.ndarray | None:
+        """The fitted current profile calculated from the full dataset."""
+        return self._fitted_current
+
+    @property
+    def yscan(self) -> np.ndarray:
+        """Axis over which the (data) scan was performed."""
+        return np.copy(self._forward.params.yscan.detach().cpu().numpy())
+
+    @property
+    def data(self) -> np.ndarray:
+        """The raw data meant to fit."""
+        return np.copy(self._data.detach().cpu().numpy())
+
+    @property
+    def prediction(self) -> np.ndarray:
+        """The predicted signal corresponding to the last-fit current."""
+        if self.current is None:
+            raise ValueError("No current has been fitted yet. Call fit() first.")
+        with torch.no_grad():
+            sensorparams = self._full_sensor_parameters(self._sensor_parameters_free)
+            return np.copy(
+                self._forward.forward_t(
+                    torch.from_numpy(self.current).to(self._device, dtype=DTYPE),
+                    sensorparams,
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+    @property
+    def convergence_checker(self) -> CoinversionConvergenceChecker | None:
+        """The object that checks for convergence of the fit."""
+        return self._convergence_checker
+
+    @convergence_checker.setter
+    def convergence_checker(self, value: CoinversionConvergenceChecker | None) -> None:
+        self._convergence_checker = value
 
 
 class Inverter2D:

@@ -26,6 +26,7 @@ Originally, SOTtools was developed for and used in [Rog, Blom *et al.*, arXiv:26
 installation
 tutorials/Tutorial_1DForward
 tutorials/Tutorial_1DBackward
+tutorials/Tutorial_1DCoinversion
 tutorials/Tutorial_2DForward
 kernelmath
 api/index

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 import sottools.backward as backward
@@ -25,7 +26,7 @@ def test_oversampled1dinversion(oversampledinverter1d_with_random_currents):
 def test_2dinversion(inverter2d_with_uniform_current):
     inverter, streamfunction = inverter2d_with_uniform_current
     res = inverter.fit(lr=1e-2, n_steps=1000)
-    np.allclose(
+    assert np.allclose(
         res["streamfunction"],
         streamfunction,
         rtol=1e-3,
@@ -265,4 +266,362 @@ def test_callbacks(inverter1d_with_random_currents):
         assert np.isfinite(state.regularization)
         assert np.all(np.isfinite(state.current))
 
-    # %%
+
+# ----------------------
+# Coinversion Unit Tests
+# ----------------------
+
+
+def test_folds():
+    coinverter_k1 = backward.Coinversion1D(
+        forward.Forward1D(
+            forward.Forward1DParameters(Lscan=10.0, Wdevice=5, Nscan=200)
+        ),
+        np.zeros(200),
+        backward.Tikhonov1(),
+        crossvalidation_size=1,
+    )
+
+    # Test that there is only 1 training and 1 test set and these are both purely True
+    assert len(coinverter_k1._folds) == 1
+    train_mask, test_mask = (m.cpu().numpy() for m in coinverter_k1._folds[0])
+    assert len(train_mask) == 200
+    assert len(test_mask) == 200
+    assert np.all(train_mask)
+    assert np.all(test_mask)
+
+    coinverter_k3 = backward.Coinversion1D(
+        forward.Forward1D(
+            forward.Forward1DParameters(Lscan=10.0, Wdevice=5, Nscan=200)
+        ),
+        np.zeros(200),
+        backward.Tikhonov1(),
+        crossvalidation_size=3,
+    )
+
+    # Test that there are 3 training sets / 3 test sets
+    # + that the test sets are disjoint and cover all indices
+    # + that the training sets are the inverse of the test sets
+    assert len(coinverter_k3._folds) == 3
+    test_indices = []
+    for train_mask, test_mask in coinverter_k3._folds:
+        train_mask, test_mask = train_mask.cpu().numpy(), test_mask.cpu().numpy()
+        assert len(train_mask) == 200
+        assert len(test_mask) == 200
+        test_indices.append(np.where(test_mask)[0])
+        # Check that training and test masks are disjoint
+        assert not np.any(train_mask & test_mask)
+        # Check that training mask is the inverse of the test mask
+        assert np.all(train_mask == ~test_mask)
+    # Check that test indices are disjoint and cover all indices
+    all_test_indices = np.concatenate(test_indices)
+    assert len(np.unique(all_test_indices)) == 200
+
+
+def test_constructor():
+    # Making a coinverter with height < rho2 * sin(phi) should raise a ValueError
+    params = forward.Forward1DParameters(Lscan=10.0, Wdevice=5, Nscan=200, rho2=0.5)
+    fwd = forward.Forward1D(params)
+    signal = fwd.forward(np.zeros(params.Ndevice))
+    regularizer = backward.Tikhonov1()
+    with pytest.raises(ValueError):
+        _ = backward.Coinversion1D(
+            fwd,
+            signal,
+            regularizer,
+            initial_height=0.1,
+            initial_phi_eff=np.deg2rad(80.0),
+        )
+
+    coinverter = backward.Coinversion1D(
+        fwd, signal, regularizer, initial_height=0.9, initial_phi_eff=np.deg2rad(80.0)
+    )
+
+    # Assert that sensor_parameters at this point is equal to the initial parameters
+    h, rho1, rho2, phi_eff = coinverter.sensor_parameters
+    assert np.isclose(h, 0.9)
+    assert np.isclose(rho1, params.rho1)
+    assert np.isclose(rho2, params.rho2)
+    assert np.isclose(phi_eff, np.deg2rad(80.0))
+
+    # Assert that at this stage, prediction raises error
+    with pytest.raises(ValueError):
+        _ = coinverter.prediction
+
+
+def test_coinverter_set_guards():
+    class lrs(backward.LearningRateScheduler):
+        def __init__(self, val):
+            self._val = val
+
+        def __call__(self, epoch):
+            return self._val
+
+    class rs(backward.RegularizerScheduler):
+        def __init__(self, val):
+            self._val = val
+
+        def __call__(self, epoch):
+            return self._val * backward.Tikhonov1()
+
+    coinverter = backward.Coinversion1D(
+        forward.Forward1D(
+            forward.Forward1DParameters(Lscan=10.0, Wdevice=5, Nscan=200)
+        ),
+        np.zeros(200),
+        lr_sensor=lrs(0.1),
+        lr_current=lrs(0.1),
+        regularizer=rs(0.1),
+    )
+
+    # Assert that setting a learning rate to a float now raises a ValueError
+    with pytest.raises(ValueError):
+        coinverter.lr_sensor = 0.1
+    with pytest.raises(ValueError):
+        coinverter.lr_current = 0.1
+    # Same for regularizer:
+    with pytest.raises(ValueError):
+        coinverter.regularizer = backward.Tikhonov1()
+
+    # Check that setting to ANOTHER scheduler does NOT raise an error
+    coinverter.lr_sensor = lrs(0.2)
+    coinverter.lr_current = lrs(0.2)
+    coinverter.regularizer = rs(0.2)
+
+
+def test_coinversion_convergence_checker():
+    # Random seed
+    rng = np.random.default_rng(0)
+
+    conv = backward.CoinversionConvergenceChecker(
+        objtol=1e-7,
+        fidtol=1e-7,
+        heighttol=1e-4,
+        phitol=1e-4,
+        nwindow=10,
+        nextrapolate=100,
+    )
+
+    # Make artificial history  and check
+    # (1) passing a short history returns False
+    history = backward.CoinversionFitHistory()
+    for i in range(5):
+        history.append(
+            fidelity=1.0 / (i + 1),
+            regularization_terms={"term": 0.0},
+            regularization=0.0,
+            objective=0.0,
+            height=1.0,
+            phi=np.deg2rad(45.0),
+        )
+    assert not conv.check(history)
+
+    # (2) passing a history that is constant with no noise returns True
+    history = backward.CoinversionFitHistory()
+    for _ in range(15):
+        history.append(
+            fidelity=1.0,
+            regularization_terms={"term": 0.0},
+            regularization=0.0,
+            objective=0.0,
+            height=1.0,
+            phi=np.deg2rad(45.0),
+        )
+    assert conv.check(history)
+
+    # (3) passing a history that is constant but with a large noise returns False
+    history = backward.CoinversionFitHistory()
+    for _ in range(15):
+        history.append(
+            fidelity=1.0 + 1e-3 * rng.standard_normal(),
+            regularization_terms={"term": 0.0},
+            regularization=0.0,
+            objective=0.0,
+            height=1.0 + 1e-3 * rng.standard_normal(),
+            phi=np.deg2rad(45.0) + 1e-3 * rng.standard_normal(),
+        )
+    assert not conv.check(history)
+
+    # (4) passing a history that is decreasing with no noise
+    # And by hand guaranteed last 10 steps within tol
+    # However extrapolates out of the window should return False
+    history = backward.CoinversionFitHistory()
+    for i in range(15):
+        history.append(
+            fidelity=1.0,
+            regularization_terms={"term": 0.0},
+            regularization=0.0,
+            objective=0.0,
+            height=1.0 + 5e-6 * i,
+            phi=np.deg2rad(45.0),
+        )
+    assert not conv.check(history)
+
+
+@pytest.mark.parametrize("invert_scan", [False, True])
+def test_cached_vs_explicit_kernels(invert_scan):
+    # Forward model whose stored height/phi deliberately differ from the coinverter's
+    # starting point, so a stale or sign-flipped cache would be detected.
+    params = forward.Forward1DParameters(
+        Lscan=10.0,
+        Wdevice=5,
+        Nscan=200,
+        rho1=0.2,
+        rho2=0.3,
+        height=0.4,
+        phi=np.deg2rad(60.0),
+        invert_scan=invert_scan,
+    )
+    fwd = forward.Forward1D(params)
+    coinverter = backward.Coinversion1D(
+        fwd,
+        np.zeros(params.Nscan),
+        backward.Tikhonov1(),
+        initial_height=0.55,
+        initial_phi_eff=np.deg2rad(-50.0),
+    )
+
+    rng = np.random.default_rng(1)
+    current = torch.from_numpy(rng.standard_normal(params.Ndevice)).to(backward.DTYPE)
+    sp = coinverter._full_sensor_parameters(coinverter._sensor_parameters_free.detach())
+
+    with torch.no_grad():
+        # Explicit path: kernel computed on the fly from (h, rho1, rho2, phi_eff)
+        explicit = coinverter._forward.forward_t(current, sp)
+        # Signal with the original, not-yet-updated cached kernel
+        stale = coinverter._forward.forward_t(current, None)
+        # Cached path: write the sensor parameters into forward.params, then reuse
+        coinverter._cache_kernels_into_forward(
+            coinverter._sensor_parameters_free, coinverter._forward
+        )
+        cached = coinverter._forward.forward_t(current, None)
+
+    scale = explicit.abs().max()
+    # Sanity: the test is only meaningful if the stale kernel differs noticeably
+    assert not torch.allclose(stale, explicit, rtol=0, atol=1e-2 * scale)
+    # The actual check: cached and explicit kernels give the same signal
+    assert torch.allclose(cached, explicit, rtol=0, atol=1e-5 * scale)
+
+
+# -----------------------------------------
+# Coinversion End-To-End real fitting tests
+# -----------------------------------------
+
+
+@pytest.mark.parametrize("K", [1, 2])
+@pytest.mark.parametrize("invert_scan", [False, True])
+def test_coinv_recovery(K, invert_scan, request, make_coinverter):
+    problem = request.getfixturevalue(
+        "coinv_problem_inverted" if invert_scan else "coinv_problem"
+    )
+    _, data, current_true, params, noise_sigma = problem
+    coinverter = make_coinverter(problem, crossvalidation_size=K)
+
+    # Run the inverter and assert that
+    # height comes out within 0.03 um of the true value
+    # phi_eff comes out within 1 degree of the true value
+    # rms current reconstruction error within 8% of the maximum current
+    res = coinverter.fit(n_steps_sensor=300, n_steps_current=200)
+    height, _, _, phi_eff = res["final_sensor_parameters"]
+
+    # Sensor parameters (inverted geometry has a larger, genuine height bias)
+    h_tol = 0.06 if invert_scan else 0.03
+    assert abs(height - params.height) < h_tol
+    assert abs(phi_eff - params.phi_eff) < np.deg2rad(1.0)
+
+    # Current: rms error relative to the peak current
+    rms = np.sqrt(np.mean((coinverter.current - current_true) ** 2))
+    assert rms < 0.08 * np.max(current_true)
+
+    # Residual: neither overfitting (chi2 << 1) nor a stalled/broken fit (chi2 >> 1)
+    chi2 = np.mean((coinverter.prediction - data) ** 2) / noise_sigma**2
+    assert 1.0 < chi2 < 2.0
+
+
+def test_coinv_contract(request, make_coinverter):
+    # Verifies that callbacks, histories, and resets are implemented consistently
+    class Testcallback:
+        # Callback that keeps a record, for testing
+        def __init__(self):
+            self.fitstates = []
+            self.called_on_step = []
+            self.called_on_finish = 0
+
+        def on_step(self, state):
+            self.fitstates.append(state)
+            self.called_on_step.append(state.step)
+
+            # Assert that objective ~ fidelity + regularization (only holds at K=1)
+            assert np.isclose(
+                state.loss, state.fidelity + state.regularization, rtol=1e-5
+            )
+
+        def on_finish(self, state):
+            self.called_on_finish += 1
+
+    class Testscheduler(backward.RegularizerScheduler):
+        # Regularizer scheduler that returns a constant regularizer and
+        # keeps a record meant for testing
+        def __init__(self, reg):
+            self.reg = reg
+            self.called_on_step = []
+
+        def __call__(self, step):
+            self.called_on_step.append(step)
+            return self.reg
+
+    cb = Testcallback()
+    ts = Testscheduler(1e-3 * backward.Tikhonov1())
+    problem = request.getfixturevalue("coinv_problem")
+    coinverter = make_coinverter(
+        problem, crossvalidation_size=1, callback=cb, callback_every=2, regularizer=ts
+    )
+
+    coinverter.fit(n_steps_sensor=4)
+    sensor_params_4steps = np.copy(coinverter.sensor_parameters)
+    res = coinverter.fit(n_steps_sensor=4)
+    assert res["steps_total"] == 8
+    assert cb.called_on_finish == 2
+    assert cb.called_on_step == [1, 3, 5, 7]
+    assert set(range(8)) <= set(coinverter.regularizer.called_on_step)
+
+    no_cache_coinverter = make_coinverter(
+        problem,
+        crossvalidation_size=1,
+        callback=None,
+        callback_every=2,
+        regularizer=1e-3 * backward.Tikhonov1(),
+        cache_kernels=False,
+    )
+    _ = no_cache_coinverter.fit(n_steps_sensor=8)
+
+    cached_height, _, _, cached_phi_eff = coinverter.sensor_parameters
+    no_cache_height, _, _, no_cache_phi_eff = no_cache_coinverter.sensor_parameters
+    assert np.isclose(cached_height, no_cache_height, atol=1e-6)
+    assert np.isclose(cached_phi_eff, no_cache_phi_eff, atol=1e-6)
+
+    coinverter.reset()
+    assert coinverter.current is None
+    assert len(coinverter.history.height_history) == 0
+    coinverter.fit(n_steps_sensor=4)
+    assert len(coinverter.history.height_history) == 4
+    assert np.allclose(coinverter.sensor_parameters, sensor_params_4steps, atol=1e-6)
+
+
+def test_coinv_convergence(coinv_problem, make_coinverter):
+    # Lax checker: objective/fidelity criteria disabled, height/phi must settle
+    checker = backward.CoinversionConvergenceChecker(
+        objtol=np.inf,
+        fidtol=np.inf,
+        heighttol=5e-3,
+        phitol=5e-3,
+        nwindow=10,
+        nextrapolate=None,
+    )
+    params = coinv_problem[3]
+    coinverter = make_coinverter(coinv_problem, convergence_checker=checker)
+    res = coinverter.fit(n_steps_sensor=300, n_steps_current=200)
+
+    assert res["message"] == "converged"
+    assert res["steps"] < 300
+    assert abs(coinverter.sensor_parameters[0] - params.height) < 0.03

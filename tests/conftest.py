@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 
 import sottools.backward as backward
 import sottools.forward as forward
@@ -94,6 +95,98 @@ def inverter1d_with_random_currents() -> tuple[backward.Inverter1D, np.ndarray]:
     inverter = backward.Inverter1D(fwd, signal, zeroregularizer)
 
     return inverter, current
+
+
+def _build_coinv_problem(
+    Lscan,
+    Nscan,
+    Wdevice,
+    SNR,
+    rho1_true,
+    rho2_true,
+    h_true,
+    phi_true,
+    invert_normal=True,
+    invert_scan=False,
+):
+    rng = np.random.default_rng(0)
+
+    params = forward.Forward1DParameters(
+        Lscan=Lscan,
+        Wdevice=Wdevice,
+        Nscan=Nscan,
+        rho1=rho1_true,
+        rho2=rho2_true,
+        height=h_true,
+        phi=phi_true,
+        invert_normal=invert_normal,
+        invert_scan=invert_scan,
+    )
+
+    deviceax = np.copy(params.ydevice.numpy())
+    pos1 = -1.2
+    pos2 = 1.6
+    sigma = 0.6
+    currents = np.exp(-((deviceax - pos1) ** 2) / (2 * sigma**2)) + np.exp(
+        -((deviceax - pos2) ** 2) / (2 * sigma**2)
+    )
+
+    forw = forward.Forward1D(params)
+    signal = forw.forward(currents)
+    noise_sigma = np.ptp(signal) / SNR
+    signal_noise = signal + rng.normal(0, noise_sigma, size=signal.shape)
+
+    return forw, signal_noise, currents, params, noise_sigma
+
+
+@pytest.fixture(scope="session")
+def coinv_problem():
+    return _build_coinv_problem(
+        Lscan=10,
+        Nscan=100,
+        Wdevice=5,
+        SNR=200,
+        rho1_true=0.2,
+        rho2_true=0.3,
+        h_true=0.5,
+        phi_true=np.deg2rad(62.0),
+        invert_normal=True,
+        invert_scan=False,
+    )
+
+
+@pytest.fixture(scope="session")
+def coinv_problem_inverted():
+    return _build_coinv_problem(
+        Lscan=10,
+        Nscan=100,
+        Wdevice=5,
+        SNR=200,
+        rho1_true=0.2,
+        rho2_true=0.3,
+        h_true=0.5,
+        phi_true=np.deg2rad(62.0),
+        invert_normal=True,
+        invert_scan=True,
+    )
+
+
+@pytest.fixture
+def make_coinverter():
+    def _make(problem, **overrides):
+        fwd, signal, _, params, _ = problem
+        kwargs = {
+            "initial_height": 1.0,
+            "initial_phi_eff": np.deg2rad(75.0) * (-1 if params.invert_scan else 1),
+            "regularizer": 1e-3 * backward.Tikhonov1(),
+            "crossvalidation_size": 2,
+            "lr_sensor": 3e-2,
+            "device": torch.device("cpu"),
+        }
+        kwargs.update(overrides)  # any Coinversion1D argument; typos raise TypeError
+        return backward.Coinversion1D(fwd, signal, **kwargs)
+
+    return _make
 
 
 @pytest.fixture(scope="session")
