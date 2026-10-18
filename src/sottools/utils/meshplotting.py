@@ -75,8 +75,80 @@ def plot_field(
     ax.invert_yaxis()
     plt.colorbar(tpc, ax=ax)
 
-
 def streamplot(
+    mesh: mesh.SingleBodyMesh,
+    ax: plt.Axes,
+    Jx: np.ndarray,
+    Jy: np.ndarray,
+    n_grid: int = 128,
+    density: float = 2.5,
+    aspect: str = "equal",
+    **kwargs,
+) -> None:
+    """Plot a streamplot of the current density on the mesh.
+
+    Uses SOT coordinate conventions: right handed coordinate system
+    with x pointing down and y pointing right.
+
+    The streamlines are computed from the exact piecewise-constant FEM current:
+    every grid point takes the value of the mesh triangle it lies in. No
+    smoothing is applied and no values leak across walls, so weak features such
+    as vortices are rendered faithfully.
+
+    Parameters
+    ----------
+    mesh: mesh.SingleBodyMesh
+        The mesh on which the current density is defined.
+    ax: plt.Axes
+        Matplotlib axes to plot on. Mutable.
+    Jx: np.ndarray
+        x-component of the current density, defined on the cell centers.
+        Shape (N_t,).
+    Jy: np.ndarray
+        y-component of the current density, defined on the cell centers.
+        Shape (N_t,).
+    n_grid: int
+        Number of grid points in each direction on which the current is
+        sampled for the streamplot. Defaults to 128.
+    density: float
+        Streamline density passed to ax.streamplot. Higher values seed more
+        streamlines, which is needed to resolve small or weak vortices.
+        Defaults to 2.5.
+    aspect: str
+        Aspect ratio of the plot. Defaults to "equal".
+    **kwargs:
+        Additional keyword arguments passed to ax.tripcolor.
+    """
+    # Colour map of |J|, plotted with x pointing down and y pointing right
+    J_abs = np.sqrt(Jx**2 + Jy**2)
+    triangulation_plot = mtri.Triangulation(
+        mesh.vertices[:, 1], mesh.vertices[:, 0], mesh.triangles
+    )
+    tpc = ax.tripcolor(triangulation_plot, J_abs, shading="flat", **kwargs)
+    ax.set_aspect(aspect)
+    plt.colorbar(tpc, ax=ax)
+
+    # Uniform grid over the mesh, in the mesh's own (x, y) coordinates
+    vx, vy = mesh.vertices[:, 0], mesh.vertices[:, 1]
+    xi = np.linspace(vx.min(), vx.max(), n_grid)
+    yi = np.linspace(vy.min(), vy.max(), n_grid)
+    Xi, Yi = np.meshgrid(xi, yi, indexing="ij")  # shape (n_grid, n_grid)
+
+    # Find the triangle containing each grid point (-1 outside the mesh)
+    triangulation_mesh = mtri.Triangulation(vx, vy, mesh.triangles)
+    triangle_index = triangulation_mesh.get_trifinder()(Xi, Yi)
+    outside = triangle_index < 0
+
+    # Sample the exact FEM current; mask grid points outside the mesh
+    Jx_i = np.ma.masked_where(outside, Jx[triangle_index])
+    Jy_i = np.ma.masked_where(outside, Jy[triangle_index])
+
+    # Horizontal axis is y, vertical axis is x (SOT convention)
+    ax.streamplot(yi, xi, Jy_i, Jx_i, color="white", density=density, linewidth=0.5)
+
+    ax.invert_yaxis()
+
+def _streamplot(
     mesh: mesh.SingleBodyMesh,
     ax: plt.Axes,
     Jx: np.ndarray,
@@ -86,6 +158,8 @@ def streamplot(
     **kwargs,
 ) -> None:
     """Plot a streamplot of the current density on the mesh.
+
+    WARNING: DEPRECATED AS OF VERSION 0.1.5. Use the new streamplot().
 
     Uses SOT coordinate conventions: right handed coordinate system
     with x pointing down and y pointing right.

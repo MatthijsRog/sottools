@@ -1756,20 +1756,37 @@ class Inverter2D:
     lam2: float
         Regularization weight for total variation regularization on the
         current density.
+    lam3: float
+        Regularization weight for 3rd order Tikhonov regularization on the
+        streamfunction, equivalent to 1st order Tikhonov on the vorticity.
     huber_e: float
         Huber parameter for total variation regularization. Default is 1e-3.
-    device: torch.device
+    lumped_mass: bool, optional
+        Whether to use a lumped mass matrix for the Tikhonov regularization.
+        Default is False, however, on fine meshes, the lumped mass matrix is
+        many times faster, and lumped_mass=False can stall the inversion.
+    initial_streamfunction: np.ndarray, optional
+        Initial guess for the streamfunction, of shape (Nmesh_vertices,). If not
+        supplied, the initial guess is zero everywhere.
+    device: torch.device, optional
         The device to use for the inversion. Default is CPU.
     """
+
+    LBFGS_MAXREPEATS = 10
+    LBFGS_TOLERANCE_GRAD = 1e-6
+    LBFGS_TOLERANCE_ABS = 1e-10
 
     def __init__(
         self,
         meshtogrid: MeshToGrid,
         currentforward: Forward2DCurrent,
         data: np.ndarray,
-        lam1: float = 1e-7,  # Tikhonov-1 on streamfunction
+        lam1: float = 1e-7,  # Tikhonov-2 on streamfunction
         lam2: float = 1e-9,  # TV on J
+        lam3: float = 1e-12, # Tikhonov-3 on streamfunction
         huber_e: float = 1e-3,  # Huber parameter for TV
+        lumped_mass: bool = False, # TODO: add lumped_mass=True to the test suite.
+        initial_streamfunction: np.ndarray | None = None,
         device: torch.device | None = None,
     ):
         if device is None:
@@ -1781,8 +1798,10 @@ class Inverter2D:
         self._currentforward = currentforward
         self._lam1 = lam1
         self._lam2 = lam2
+        self._lam3 = lam3
         self._huber_e = huber_e
         self._device = device
+        self._lumped_mass = lumped_mass
 
         # Mesh properties
         self._N_points = len(self._mesh.vertices)
@@ -1803,46 +1822,100 @@ class Inverter2D:
         )
 
         # Tikhonov matrices
+        # This matrix is K^F,T M^FF,-1 K^F
         self._stiffness_matrix = self._mesh.stiffness_matrix
         self._mass_matrix = scipy.sparse.csr_matrix(self._mesh.mass_matrix)
         K_rows_free = self._stiffness_matrix[self._mesh.free_idx, :]  # (N_free, N_all)
-        Mff = scipy.sparse.csr_matrix(
-            self._mass_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
-        )  # (N_free, N_free)
-        Kt_Minv_K = (
-            K_rows_free.tocsc()
-            .transpose()
-            .dot(scipy.sparse.linalg.spsolve(Mff, K_rows_free.tocsc()))
-        )  # (N_all, N_all)
-        self._tikhonov_matrix_dense = torch.from_numpy(Kt_Minv_K.toarray()).to(
-            device, dtype=DTYPE
-        )
+        if not lumped_mass:
+            Mff = scipy.sparse.csr_matrix(
+                self._mass_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
+            )  # (N_free, N_free)
+            Kt_Minv_K = (
+                K_rows_free.tocsc()
+                .transpose()
+                .dot(scipy.sparse.linalg.spsolve(Mff, K_rows_free.tocsc()))
+            )  # (N_all, N_all)
+            self._tikhonov_matrix_dense = torch.from_numpy(Kt_Minv_K.toarray()).to(
+                device, dtype=DTYPE
+            )
+            self._tikhonov_matrix_sparse = None
+        else:
+            # Lump by make each diagnonal element the row sum
+            Mff = scipy.sparse.csr_matrix(
+                self._mass_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
+            )  # (N_free, N_free)
+            Mff_diag = np.array(Mff.sum(axis=1)).flatten()  # (N_free,)
+            Kt_Minv_K = K_rows_free.T @ (
+                scipy.sparse.diags(1.0 / Mff_diag) @ K_rows_free
+            )
+            self._tikhonov_matrix_sparse = self._scipy_csr_to_torch_sparse(Kt_Minv_K)
+            self._tikhonov_matrix_dense = None
 
         # TV matrices
-        self._DGx = torch.tensor(
-            (
-                self._mesh.edgedifference_operator @ self._mesh.gradient_operator_x
-            ).toarray(),
-            dtype=DTYPE,
-            device=device,
-        )
-        self._DGy = torch.tensor(
-            (
-                self._mesh.edgedifference_operator @ self._mesh.gradient_operator_y
-            ).toarray(),
-            dtype=DTYPE,
-            device=device,
-        )
+        DGx = (
+            self._mesh.edgedifference_operator @ self._mesh.gradient_operator_x
+        ).tocoo()
+        self._DGx = self._scipy_csr_to_torch_sparse(DGx)
+        DGy = (
+            self._mesh.edgedifference_operator @ self._mesh.gradient_operator_y
+        ).tocoo()
+        self._DGy = self._scipy_csr_to_torch_sparse(DGy)
 
-        # Initialize streamfunction with zeros
-        N_free_vals = np.sum(self._mesh.free_mask)
-        N_solution = 1 + N_free_vals  # 1 for the Dirichlet value on the right boundary
-        self._solution = torch.nn.Parameter(
-            torch.zeros(N_solution, dtype=DTYPE, device=device)
-        )
+        # Vortex regularization matrices
+        # This matrix has the shape (K^F)^T M^FF,-1 K^FF M^FF,-1 K^F
+        # M^FF,-1 can be used exact or lumped.
+        Kf = K_rows_free
+        Kff = self._stiffness_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
+        # Mff is already in memory from the Tikhonov calculation above
+        if not lumped_mass:
+            Kt_Minv_Kff_Minv_K = Kf.T @ (
+                scipy.sparse.linalg.spsolve(
+                    Mff, Kff @ scipy.sparse.linalg.spsolve(Mff, Kf)
+                )
+            )
+            self._vorticity_matrix_dense = torch.from_numpy(
+                Kt_Minv_Kff_Minv_K.toarray()
+            ).to(device, dtype=DTYPE)
+            self._vorticity_matrix_sparse = None
+        else:
+            Mff_diag = np.array(Mff.sum(axis=1)).flatten()  # (N_free,)
+            Kt_Minv_Kff_Minv_K = Kf.T @ (scipy.sparse.diags(1.0 / Mff_diag) @ Kff @ scipy.sparse.diags(1.0 / Mff_diag) @ Kf)
+            self._vorticity_matrix_sparse = self._scipy_csr_to_torch_sparse(Kt_Minv_Kff_Minv_K)
+            self._vorticity_matrix_dense = None
 
-        # Optimizer pre-defined so that restarts are possible:
-        self._optimizer = torch.optim.Adam([self._solution], lr=1e-2)
+        # Initial solution vector: [right-wall value, free-node values].
+        # The user supplies a full streamfunction (N_vertices,); convert it to this layout.
+        N_solution = 1 + int(np.sum(self._mesh.free_mask))
+        solution0 = torch.zeros(N_solution, dtype=DTYPE, device=device)
+        if initial_streamfunction is not None:
+            g0 = np.asarray(initial_streamfunction, dtype=float)
+            if g0.shape != (self._N_points,):
+                raise ValueError(
+                    f"initial_streamfunction must have shape ({self._N_points},), "
+                    f"got {g0.shape}."
+                )
+            if not np.allclose(g0[self._mesh.dirichletleft_mask], 0.0):
+                raise ValueError(
+                    "initial_streamfunction must be zero on the left Dirichlet boundary."
+                )
+            right_values = g0[self._mesh.dirichletright_mask]
+            if not np.allclose(right_values, right_values[0]):
+                raise ValueError(
+                    "initial_streamfunction must be constant on the right Dirichlet boundary."
+                )
+            solution0[0] = float(right_values[0])
+            solution0[1:] = torch.from_numpy(g0[self._mesh.free_mask]).to(
+                dtype=DTYPE, device=device
+            )
+        self._solution = torch.nn.Parameter(solution0)
+
+    def _scipy_csr_to_torch_sparse(self, csr: scipy.sparse.csr_matrix) -> torch.Tensor:
+        coo = csr.tocoo()
+        indices = torch.from_numpy(np.vstack([coo.row, coo.col]).astype(np.int64))
+        values = torch.from_numpy(coo.data).to(dtype=DTYPE)
+        return torch.sparse_coo_tensor(
+            indices, values, size=coo.shape, device=self._device
+        ).coalesce()
 
     def _solution_to_streamvector(self) -> torch.Tensor:
         N_points = len(self._mesh.vertices)
@@ -1868,7 +1941,10 @@ class Inverter2D:
         only weigh interior nodes, however, so that the total current can
         freely change.
         """
-        return torch.dot(streamvector, self._tikhonov_matrix_dense @ streamvector)
+        if self._lumped_mass:
+            return torch.dot(streamvector, self._tikhonov_matrix_sparse @ streamvector)
+        else:
+            return torch.dot(streamvector, self._tikhonov_matrix_dense @ streamvector)
 
     def _tv_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
         """Total variation regularization on the current density J.
@@ -1887,9 +1963,15 @@ class Inverter2D:
 
         return torch.dot(self._edge_lengths, huber_mag)
 
+    def _vorticity_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
+        if self._vorticity_matrix_sparse is not None:
+            return torch.dot(streamvector, self._vorticity_matrix_sparse @ streamvector)
+        else:
+            return torch.dot(streamvector, self._vorticity_matrix_dense @ streamvector)
+
     def _objective(
         self, solution: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         streamvector = self._solution_to_streamvector()
         signal = self._currentforward.forward_t(
             *self._meshtogrid.streamfunction_to_currents_t(streamvector)
@@ -1898,37 +1980,36 @@ class Inverter2D:
         fidelity = self._fidelity(signal)
         tikhonov_reg = self._tikhonov_regularization(streamvector)
         tv_reg = self._tv_regularization(streamvector)
+        vor_reg = self._vorticity_regularization(streamvector)
 
         return (
-            fidelity + self._lam1 * tikhonov_reg + self._lam2 * tv_reg,
+            fidelity +
+            self._lam1 * tikhonov_reg +
+            self._lam2 * tv_reg +
+            self._lam3 * vor_reg,
             fidelity,
             tikhonov_reg,
             tv_reg,
+            vor_reg
         )
 
     def fit(
         self,
-        lr: float = 1e-2,
-        n_steps: int = 20000,
-        callback: FitCallback | None = None,
-        callback_every: int = 500,
+        lr: float = 1,
+        n_steps: int = 200,
     ) -> dict[str, typing.Any]:
         """Fit the current distribution to the data using gradient descent.
 
-        Performs ADAM fit of the current distribution to the data using the
+        Performs L-BFGS fit of the current distribution to the data using the
         forward model while continually regularizing. Can be restarted if
         parameter variation is required.
 
         Parameters
         ----------
         lr: float
-            Learning rate for the ADAM optimizer. Default is 1e-2.
+            Learning rate for the L-BFGS optimizer. Default is 1.
         n_steps: int
-            Number of steps to run the optimizer. Default is 20000.
-        callback: FitCallback
-            Callback function to call at each (callback) step. Default is None.
-        callback_every: int
-            Number of steps between callback calls. Default is 500.
+            Number of steps to run the optimizer. Default is 200.
 
         Returns
         -------
@@ -1941,53 +2022,51 @@ class Inverter2D:
             - "Ky": np.ndarray of shape (N_triangles,) representing the
               recovered current density in the y-direction on the cell centers.
             - "mesh": Mesh object representing the mesh used for the inversion.
-            - "loss_history": np.ndarray of shape (n_steps,) representing the
-              history of the loss function during the fit.
-            - "fidelity_history": np.ndarray of shape (n_steps,) representing
-              the history of the fidelity term during the fit.
+            - "loss_history": np.ndarray  representing the history of the loss function
+               during the fit.
+            - "fidelity_history": np.ndarray of shape (n_steps,) representing the
+               history of the fidelity term during the fit.
         """
-        # First ensure proper learning rate is set
-        for param_group in self._optimizer.param_groups:
-            param_group["lr"] = lr
-        optimizer = self._optimizer
+        loss_history: list[float] = []
+        fidelity_history: list[float] = []
 
-        loss_history = torch.zeros(n_steps, device=self._device, dtype=DTYPE)
-        fidelity_history = torch.zeros(n_steps, device=self._device, dtype=DTYPE)
+        current_optimizer = torch.optim.LBFGS(
+            [self._solution],
+            lr=lr,
+            max_iter=n_steps,
+            max_eval=n_steps * 5,
+            tolerance_grad=self.LBFGS_TOLERANCE_GRAD,
+            tolerance_change=self.LBFGS_TOLERANCE_ABS,
+            line_search_fn="strong_wolfe"
+        )
 
-        for step in range(n_steps):
-            optimizer.zero_grad()
+        norm_constant = torch.mean(self._data**2).detach()  # For normalizing the loss history
+        def closure() -> torch.Tensor:
+            current_optimizer.zero_grad()
+            loss, fidelity, *_ = self._objective(self._solution)
+            loss_history.append(loss.item())
+            fidelity_history.append(fidelity.item())
+            normalized_loss = loss / norm_constant
+            normalized_loss.backward()  # type: ignore[no-untyped-call]
+            return normalized_loss
 
-            loss, fidelity, tikhonov_reg, tv_reg = self._objective(self._solution)
-            loss.backward()  # type: ignore[no-untyped-call]
-            optimizer.step()
-
-            loss_history[step] = loss.detach()
-            fidelity_history[step] = fidelity.detach()
-
-            if callback and (step % callback_every == 0 or step == n_steps - 1):
-                state = FitState1D(
-                    step=step,
-                    total_steps=n_steps,
-                    loss=loss.item(),
-                    fidelity=fidelity.item(),
-                    regularization=(
-                        self._lam1 * tikhonov_reg + self._lam2 * tv_reg
-                    ).item(),
-                    regularization_terms={
-                        "tikhonov": tikhonov_reg.item(),
-                        "tv": tv_reg.item(),
-                    },
-                    current=None,
-                    predicted_signal=None,
-                    to_fit_signal=None,
-                    xaxis_current=None,
-                    xaxis_signal=None,
+        # As long as max_steps is reached, continue, to ensure we end up converged
+        st = current_optimizer.state[self._solution]
+        n_before = 0  # fresh optimizer
+        current_optimizer.step(closure)  # type: ignore[no-untyped-call]
+        nrepeats = 1
+        while st["n_iter"] - n_before == n_steps:
+            n_before = st["n_iter"]
+            current_optimizer.step(closure)  # type: ignore[no-untyped-call]
+            nrepeats += 1
+            if nrepeats > self.LBFGS_MAXREPEATS:
+                warnings.warn(
+                    "LBFGS did not converge within the maximum number of repeats. "
+                    "Consider increasing n_steps or adjusting lr. "
+                    "Alternatively, perhaps the tolerance is set too strictly.",
+                    stacklevel=2,
                 )
-
-                if step == n_steps - 1:
-                    callback.on_finish(state)
-                else:
-                    callback.on_step(state)
+                break
 
         streamfunction = self._solution_to_streamvector().detach().cpu().numpy()
         Kx, Ky = self._mesh.field_curl(streamfunction)
@@ -1997,8 +2076,8 @@ class Inverter2D:
             "Kx": Kx,
             "Ky": Ky,
             "mesh": self._mesh,
-            "loss_history": loss_history.detach().cpu().numpy(),
-            "fidelity_history": fidelity_history.detach().cpu().numpy(),
+            "loss_history": np.array(loss_history),
+            "fidelity_history": np.array(fidelity_history),
         }
 
         return res
@@ -2022,3 +2101,13 @@ class Inverter2D:
     def lam2(self, value: float) -> None:
         """Set the weight of total variation regularization."""
         self._lam2 = value
+
+    @property
+    def lam3(self) -> float:
+        """Weight of vorticity regularization."""
+        return self._lam3
+
+    @lam3.setter
+    def lam3(self, value: float) -> None:
+        """Set the weight of vorticity regularization."""
+        self._lam3 = value
