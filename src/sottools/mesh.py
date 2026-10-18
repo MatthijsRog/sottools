@@ -838,3 +838,211 @@ class LondonSolver:
     def _calculate_Bz(self, Kx: np.ndarray, Ky: np.ndarray) -> np.ndarray:
         Bz: np.ndarray = (self.MU0 / (4 * np.pi)) * (self.Cx @ Kx - self.Cy @ Ky)
         return Bz
+
+
+class HydroSolver:
+    """Solver for the electron-hydrodynamic equations in a simply connected geometry.
+
+    Solves the electron-hydrodynamic equations (EHE) in the streamfunction-vorticity
+    formulation:
+
+    -tau/(e*n) (dg/dy domega/dx - dg/dx domega/dy) - D^2 nabla^2 omega + omega = 0
+    nabla^2 g = -omega
+
+    We use the stiffness and mass matrices K and M of the mesh to discretize the
+    equations. The boundary conditions are no-slip and dirichlet on the vacuum
+    boundaries for only the streamfunction (i.e. we fix the total current). K and M, as
+    constructed, are of shape (N_v, N_v) but we often need (N_free, N_v), (N_free,
+    N_free), etc. For this we use shorthand K^F, K^FF, etc. In this way, the EHE reduce
+    to:
+
+    K^FF g_F - M^F omega = -K^FD g_D
+    (-tau/e*n V_F + D^2 K^F + M^F) omega = 0
+    -K^DF g^F + M^D omega = K^DD g^D
+
+    Which can be iteratively solved, but only as a block system. The V matrix has to be
+    constructed from a lagging streamfunction g and is constructed from g and the
+    C-tensor of the mesh, where the C-tensor is
+
+    C_ijk = int dA (nabla phi_j) x (nabla phi_k) . zhat phi_i
+
+    V_ij is then sum_k C_ijk g_k. g converges through Picard iteration.
+
+    Parameters
+    ----------
+    mesh: SimplyConnectedCurrentMesh
+        The mesh on which to solve the EHE.
+    ten: float
+        The parameter tau / e n, where tau is the momentum relaxation time, e is the
+        electron charge, and n is the electron density. Defaults to 1.0.
+    D: float
+        The viscous length. Defaults to 1.0.
+    verbose: bool, optional
+        If true, debug messages are printed to console. Defaults to False.
+    """
+
+    def __init__(
+        self,
+        mesh: SimplyConnectedCurrentMesh,
+        ten: float = 1.0,
+        D: float = 1.0,
+        verbose: bool = False,
+    ) -> None:
+        self.mesh = mesh
+        self.ten = ten  # tau / e n
+        self.D = D  # diffusion constant
+        self.verbose = verbose
+
+    def _v_matrix(self, g: np.ndarray) -> scipy.sparse.csr_matrix:
+        """Construct the V matrix for the hydrodynamic solver.
+
+        Parameters
+        ----------
+        g: np.ndarray
+            The streamfunction values at the vertices. Shape (N_v,).
+
+        Returns
+        -------
+        V_F: scipy.sparse.csr_matrix
+            The V matrix restricted to the free vertices. Shape (N_free, N_v).
+        """
+        N_t = self.mesh.triangles.shape[0]
+        N_v = self.mesh.vertices.shape[0]
+        g_t = g[self.mesh.triangles]  # (N_t, 3)
+        weights = (np.roll(g_t, -1, axis=1) - np.roll(g_t, -2, axis=1)) / 6
+        V_entries = np.broadcast_to(weights[:, None, :], (N_t, 3, 3))
+        cols = self.mesh.triangles[:, None, :].repeat(3, axis=1)  # (N_t, 3, 3)
+        rows = self.mesh.triangles[:, :, None].repeat(3, axis=2)  # (N_t, 3, 3)
+        V = scipy.sparse.coo_matrix(
+            (V_entries.ravel(), (rows.ravel(), cols.ravel())), shape=(N_v, N_v)
+        ).tocsr()
+        V_F = V[self.mesh.free_idx]  # (N_free, N_v)
+        return V_F
+
+    def _step(
+        self,
+        left_bc: float,
+        right_bc: float,
+        g_old: np.ndarray,  # (N_v,)
+    ) -> tuple[np.ndarray, np.ndarray]:
+        # Solve the hydrodynamic equations for g and omega
+        # in block format. The solution is a single vector of length (N_free + N_v,)
+        # where the N_free part corresponds to the free vertices of g and the N_v part
+        # corresponds to omega.
+
+        # Equations:
+        # K^FF g_F - M^F omega = -K^FD g_D
+        # (-ten V_F + D^2 K^F + M^F) omega = 0
+        # -K^DF g^F + M^D omega = K^DD g^D
+
+        V_F = self._v_matrix(g_old)  # (N_free, N_v)
+        K_F = self.mesh.stiffness_matrix[self.mesh.free_idx]  # (N_free, N_v)
+        K_FF = self.mesh.stiffness_matrix[self.mesh.free_idx][:, self.mesh.free_idx]
+        K_FD = self.mesh.stiffness_matrix[self.mesh.free_idx][
+            :, self.mesh.dirichlet_idx
+        ]
+        K_DF = self.mesh.stiffness_matrix[self.mesh.dirichlet_idx][
+            :, self.mesh.free_idx
+        ]
+        K_DD = self.mesh.stiffness_matrix[self.mesh.dirichlet_idx][
+            :, self.mesh.dirichlet_idx
+        ]
+        M_F = self.mesh.mass_matrix[self.mesh.free_idx]
+        M_D = self.mesh.mass_matrix[self.mesh.dirichlet_idx]
+
+        block_matrix = scipy.sparse.bmat(
+            [
+                [K_FF, -M_F],
+                [None, -self.ten * V_F + self.D**2 * K_F + M_F],
+                [-K_DF, M_D],
+            ],
+            format="csc",
+        )
+
+        g = np.zeros(self.mesh.vertices.shape[0])
+        g[self.mesh.dirichletleft_mask] = left_bc
+        g[self.mesh.dirichletright_mask] = right_bc
+        g_D = g[self.mesh.dirichlet_idx]
+        rhs_1 = -K_FD @ g_D
+        rhs_2 = np.zeros(self.mesh.free_idx.shape[0])
+        rhs_3 = K_DD @ g_D
+
+        rhs = np.concatenate([rhs_1, rhs_2, rhs_3])
+
+        solution = scipy.sparse.linalg.spsolve(block_matrix, rhs)
+
+        g[self.mesh.free_idx] = solution[: self.mesh.free_idx.shape[0]]
+        omega = solution[self.mesh.free_idx.shape[0] :]
+        return g, omega
+
+    def solve(
+        self,
+        left_bc: float,
+        right_bc: float,
+        alpha: float = 0.8,
+        max_iter: int = 50,
+        rtol: float = 1e-5,
+    ) -> dict[str, object]:
+        """Solve the hydrodynamic equations for a given mesh and parameters.
+
+        Parameters
+        ----------
+        left_bc: float
+            The Dirichlet boundary condition on the left boundary.
+        right_bc: float
+            The Dirichlet boundary condition on the right boundary.
+        alpha: float, optional
+            The relaxation parameter for the iterative solver. Defaults to 0.8.
+        max_iter: int, optional
+            The maximum number of iterations for the solver. Defaults to 50.
+        rtol: float, optional
+            The relative tolerance for convergence. Defaults to 1e-5.
+
+        Returns
+        -------
+        dict[str, object]
+            A dictionary containing the results of the solver, including:
+            - "converged": bool, whether the solver converged
+            - "streamfunction": np.ndarray, the streamfunction values
+            - "vorticity": np.ndarray, the vorticity values
+            - "Kx": np.ndarray, the x-component of the sheet current density
+            - "Ky": np.ndarray, the y-component of the sheet current density
+        """
+        g = np.zeros(self.mesh.vertices.shape[0])
+        omega = np.zeros(self.mesh.vertices.shape[0])
+        g[self.mesh.dirichletleft_mask] = left_bc
+        g[self.mesh.dirichletright_mask] = right_bc
+
+        did_converge = False
+        for iter in range(max_iter):
+            g_new, omega_new = self._step(left_bc, right_bc, g)
+
+            g = (1 - alpha) * g + alpha * g_new
+            omega = (1 - alpha) * omega + alpha * omega_new
+
+            rdiff_g = np.linalg.norm(g_new - g) / np.linalg.norm(g)
+            rdiff_omega = np.linalg.norm(omega_new - omega) / np.linalg.norm(omega)
+
+            if self.verbose:
+                print(
+                    f"Iter {iter}: relative change in g: {rdiff_g:.2e}, "
+                    f"relative change in omega: {rdiff_omega:.2e}"
+                )
+
+            if rdiff_g < rtol and rdiff_omega < rtol:
+                if self.verbose:
+                    print(f"Converged after {iter + 1} iterations")
+                did_converge = True
+                break
+
+        Kx, Ky = self.mesh.field_curl(g)
+
+        res = {
+            "converged": did_converge,
+            "streamfunction": g,
+            "vorticity": omega,
+            "Kx": Kx,
+            "Ky": Ky,
+        }
+
+        return res

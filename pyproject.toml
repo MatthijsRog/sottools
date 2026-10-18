@@ -105,6 +105,7 @@ module = ["sottools.mesh"]
 warn_return_any = false
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.coverage.run]
