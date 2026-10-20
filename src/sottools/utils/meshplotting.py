@@ -75,6 +75,45 @@ def plot_field(
     ax.invert_yaxis()
     plt.colorbar(tpc, ax=ax)
 
+
+def plot_tc_field(
+    mesh: mesh.SingleBodyMesh,
+    ax: plt.Axes,
+    field: np.ndarray,
+    aspect: str = "equal",
+    **kwargs,
+) -> None:
+    """Plot a triangle-centered field on the mesh.
+
+    Uses tripcolor, thereby visualizing the assumed piecewise linear
+    structure of a field in FEM implementations.
+
+    Uses SOT coordinate conventions: right handed coordinate system
+    with x pointing down and y pointing right.
+
+    Parameters
+    ----------
+    ax: plt.Axes
+        Matplotlib axes to plot on. Mutable.
+
+    field: np.ndarray
+        Field defined on the triangles of the mesh. Shape (N_t,).
+
+    aspect: str
+        Aspect ratio of the plot. Defaults to "equal".
+
+    **kwargs:
+        Additional keyword arguments passed to ax.tripcolor.
+    """
+    triangulation = mtri.Triangulation(
+        mesh.vertices[:, 1], mesh.vertices[:, 0], mesh.triangles
+    )
+    tpc = ax.tripcolor(triangulation, field, shading="flat", **kwargs)
+    ax.set_aspect(aspect)
+    ax.invert_yaxis()
+    plt.colorbar(tpc, ax=ax)
+
+
 def streamplot(
     mesh: mesh.SingleBodyMesh,
     ax: plt.Axes,
@@ -148,6 +187,7 @@ def streamplot(
 
     ax.invert_yaxis()
 
+
 def _streamplot(
     mesh: mesh.SingleBodyMesh,
     ax: plt.Axes,
@@ -209,5 +249,106 @@ def _streamplot(
     Jx_i[mask] = np.nan
     Jy_i[mask] = np.nan
     ax.streamplot(yi, xi, Jy_i, Jx_i, color="white", density=0.65, linewidth=0.5)
+
+    ax.invert_yaxis()
+
+
+def quiverplot(
+    mesh: mesh.SingleBodyMesh,
+    ax: plt.Axes,
+    g: np.ndarray,
+    n_grid: int = 512,
+    arrow_spacing: float | None = None,
+    scale: float | None = None,
+    kind: str = "min_E",
+    aspect: str = "equal",
+    quiver_kwargs: dict | None = None,
+    **kwargs,
+) -> None:
+    """Plot a smoothed current density, derived from the streamfunction.
+
+    Uses SOT coordinate conventions: right handed coordinate system
+    with x pointing down and y pointing right.
+
+    The vertex-centered streamfunction is interpolated with a C1 piecewise
+    cubic (Clough-Tocher) interpolant. The current density J = curl(g z_hat),
+    i.e. Jx = dg/dy and Jy = -dg/dx, is obtained from the analytic gradient of
+    this interpolant. This yields a continuous current, in contrast to the
+    piecewise-constant current of the linear FEM representation. The colour
+    map shows |J| on a fine grid; arrows show J on a coarser regular array.
+
+    Parameters
+    ----------
+    mesh: mesh.SingleBodyMesh
+        The mesh on which the streamfunction is defined.
+    ax: plt.Axes
+        Matplotlib axes to plot on. Mutable.
+    g: np.ndarray
+        Streamfunction defined on the vertices of the mesh. Shape (N_v,).
+    n_grid: int
+        Number of grid points in each direction on which |J| is evaluated
+        for the colour map. Defaults to 512.
+    arrow_spacing: float | None
+        Spacing of the arrow array, in mesh length units. Defaults to 1/20
+        of the largest mesh extent.
+    scale: float | None
+        Current density per unit of plot length. Arrow length is |J| / scale
+        in mesh length units, so larger values give shorter arrows. None
+        uses matplotlib's autoscaling.
+    kind: str
+        Smoothing algorithm of mtri.CubicTriInterpolator: "min_E" (smoothest,
+        solves a global sparse system) or "geom" (faster, local).
+        Defaults to "min_E".
+    aspect: str
+        Aspect ratio of the plot. Defaults to "equal".
+    quiver_kwargs: dict | None
+        Additional keyword arguments passed to ax.quiver.
+    **kwargs:
+        Additional keyword arguments passed to ax.pcolormesh.
+    """
+    # C1 cubic interpolant of g, in the mesh's own (x, y) coordinates
+    vx, vy = mesh.vertices[:, 0], mesh.vertices[:, 1]
+    triangulation_mesh = mtri.Triangulation(vx, vy, mesh.triangles)
+    interpolator = mtri.CubicTriInterpolator(triangulation_mesh, g, kind=kind)
+
+    # Fine uniform grid over the mesh; gradient is masked outside the mesh
+    xi = np.linspace(vx.min(), vx.max(), n_grid)
+    yi = np.linspace(vy.min(), vy.max(), n_grid)
+    Xi, Yi = np.meshgrid(xi, yi, indexing="ij")  # shape (n_grid, n_grid)
+    dg_dx, dg_dy = interpolator.gradient(Xi, Yi)
+    J_abs_i = np.ma.sqrt(dg_dx**2 + dg_dy**2)
+
+    # Colour map of |J|; horizontal axis is y, vertical axis is x (SOT convention)
+    pcm = ax.pcolormesh(yi, xi, J_abs_i, shading="auto", **kwargs)
+    ax.set_aspect(aspect)
+    plt.colorbar(pcm, ax=ax)
+
+    # Regular arrow array, centred within the mesh extent
+    if arrow_spacing is None:
+        arrow_spacing = max(np.ptp(vx), np.ptp(vy)) / 20
+    xq = np.arange(vx.min() + arrow_spacing / 2, vx.max(), arrow_spacing)
+    yq = np.arange(vy.min() + arrow_spacing / 2, vy.max(), arrow_spacing)
+    Xq, Yq = np.meshgrid(xq, yq, indexing="ij")
+
+    # Evaluate the current exactly at the arrow points (not subsampled from grid)
+    dg_dx_q, dg_dy_q = interpolator.gradient(Xq, Yq)
+    Jx_q = dg_dy_q
+    Jy_q = -dg_dx_q
+
+    # angles="xy" makes arrows follow data coordinates, so they stay correct
+    # after the vertical axis is inverted
+    quiver_kwargs = {} if quiver_kwargs is None else dict(quiver_kwargs)
+    quiver_kwargs.setdefault("color", "white")
+    quiver_kwargs.setdefault("pivot", "middle")
+    ax.quiver(
+        Yq,
+        Xq,
+        Jy_q,
+        Jx_q,
+        angles="xy",
+        scale_units="xy",
+        scale=scale,
+        **quiver_kwargs,
+    )
 
     ax.invert_yaxis()

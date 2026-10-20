@@ -593,3 +593,4 @@ def test_sensor_onthefly_matches_cached_1d(monkeypatch: pytest.MonkeyPatch) -> N
     s_onthefly = fwd.forward_t(current, sensor)
 
     assert torch.allclose(s_cached, s_onthefly, rtol=1e-10, atol=1e-12)
+

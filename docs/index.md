@@ -28,6 +28,9 @@ tutorials/Tutorial_1DForward
 tutorials/Tutorial_1DBackward
 tutorials/Tutorial_1DCoinversion
 tutorials/Tutorial_2DForward
+tutorials/Tutorial_2DBackward_Hydro
+tutorials/Tutorial_2DBackward_InhomogeneousResistivity
+tutorials/Tutorial_2DBackward_Meissner
 kernelmath
 api/index
 ```

@@ -1783,9 +1783,9 @@ class Inverter2D:
         data: np.ndarray,
         lam1: float = 1e-7,  # Tikhonov-2 on streamfunction
         lam2: float = 1e-9,  # TV on J
-        lam3: float = 1e-12, # Tikhonov-3 on streamfunction
+        lam3: float = 1e-12,  # Tikhonov-3 on streamfunction
         huber_e: float = 1e-3,  # Huber parameter for TV
-        lumped_mass: bool = False, # TODO: add lumped_mass=True to the test suite.
+        lumped_mass: bool = False,  # TODO: add lumped_mass=True to the test suite.
         initial_streamfunction: np.ndarray | None = None,
         device: torch.device | None = None,
     ):
@@ -1823,6 +1823,8 @@ class Inverter2D:
 
         # Tikhonov matrices
         # This matrix is K^F,T M^FF,-1 K^F
+        self._tikhonov_matrix_dense: torch.Tensor | None = None
+        self._tikhonov_matrix_sparse: torch.Tensor | None = None
         self._stiffness_matrix = self._mesh.stiffness_matrix
         self._mass_matrix = scipy.sparse.csr_matrix(self._mesh.mass_matrix)
         K_rows_free = self._stiffness_matrix[self._mesh.free_idx, :]  # (N_free, N_all)
@@ -1866,6 +1868,8 @@ class Inverter2D:
         # M^FF,-1 can be used exact or lumped.
         Kf = K_rows_free
         Kff = self._stiffness_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
+        self._vorticity_matrix_dense: torch.Tensor | None = None
+        self._vorticity_matrix_sparse: torch.Tensor | None = None
         # Mff is already in memory from the Tikhonov calculation above
         if not lumped_mass:
             Kt_Minv_Kff_Minv_K = Kf.T @ (
@@ -1879,12 +1883,19 @@ class Inverter2D:
             self._vorticity_matrix_sparse = None
         else:
             Mff_diag = np.array(Mff.sum(axis=1)).flatten()  # (N_free,)
-            Kt_Minv_Kff_Minv_K = Kf.T @ (scipy.sparse.diags(1.0 / Mff_diag) @ Kff @ scipy.sparse.diags(1.0 / Mff_diag) @ Kf)
-            self._vorticity_matrix_sparse = self._scipy_csr_to_torch_sparse(Kt_Minv_Kff_Minv_K)
+            Kt_Minv_Kff_Minv_K = Kf.T @ (
+                scipy.sparse.diags(1.0 / Mff_diag)
+                @ Kff
+                @ scipy.sparse.diags(1.0 / Mff_diag)
+                @ Kf
+            )
+            self._vorticity_matrix_sparse = self._scipy_csr_to_torch_sparse(
+                Kt_Minv_Kff_Minv_K
+            )
             self._vorticity_matrix_dense = None
 
         # Initial solution vector: [right-wall value, free-node values].
-        # The user supplies a full streamfunction (N_vertices,); convert it to this layout.
+        # The user supplies a full streamfunction (N_vertices,)
         N_solution = 1 + int(np.sum(self._mesh.free_mask))
         solution0 = torch.zeros(N_solution, dtype=DTYPE, device=device)
         if initial_streamfunction is not None:
@@ -1896,12 +1907,14 @@ class Inverter2D:
                 )
             if not np.allclose(g0[self._mesh.dirichletleft_mask], 0.0):
                 raise ValueError(
-                    "initial_streamfunction must be zero on the left Dirichlet boundary."
+                    "initial_streamfunction must be zero on the left Dirichlet "
+                    "boundary."
                 )
             right_values = g0[self._mesh.dirichletright_mask]
             if not np.allclose(right_values, right_values[0]):
                 raise ValueError(
-                    "initial_streamfunction must be constant on the right Dirichlet boundary."
+                    "initial_streamfunction must be constant on the right Dirichlet "
+                    "boundary."
                 )
             solution0[0] = float(right_values[0])
             solution0[1:] = torch.from_numpy(g0[self._mesh.free_mask]).to(
@@ -1941,10 +1954,15 @@ class Inverter2D:
         only weigh interior nodes, however, so that the total current can
         freely change.
         """
-        if self._lumped_mass:
+        if self._lumped_mass and self._tikhonov_matrix_sparse is not None:
             return torch.dot(streamvector, self._tikhonov_matrix_sparse @ streamvector)
-        else:
+        elif self._tikhonov_matrix_dense is not None:
             return torch.dot(streamvector, self._tikhonov_matrix_dense @ streamvector)
+        else:
+            raise ValueError(
+                "Tikhonov regularization matrix is not defined. This indicates a "
+                "problem in the module. Raise an issue on GitHub."
+            )
 
     def _tv_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
         """Total variation regularization on the current density J.
@@ -1966,8 +1984,13 @@ class Inverter2D:
     def _vorticity_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
         if self._vorticity_matrix_sparse is not None:
             return torch.dot(streamvector, self._vorticity_matrix_sparse @ streamvector)
-        else:
+        elif self._vorticity_matrix_dense is not None:
             return torch.dot(streamvector, self._vorticity_matrix_dense @ streamvector)
+        else:
+            raise ValueError(
+                "Vorticity regularization matrix is not defined. This indicates a "
+                "problem in the module. Raise an issue on GitHub."
+            )
 
     def _objective(
         self, solution: torch.Tensor
@@ -1983,14 +2006,14 @@ class Inverter2D:
         vor_reg = self._vorticity_regularization(streamvector)
 
         return (
-            fidelity +
-            self._lam1 * tikhonov_reg +
-            self._lam2 * tv_reg +
-            self._lam3 * vor_reg,
+            fidelity
+            + self._lam1 * tikhonov_reg
+            + self._lam2 * tv_reg
+            + self._lam3 * vor_reg,
             fidelity,
             tikhonov_reg,
             tv_reg,
-            vor_reg
+            vor_reg,
         )
 
     def fit(
@@ -2037,10 +2060,13 @@ class Inverter2D:
             max_eval=n_steps * 5,
             tolerance_grad=self.LBFGS_TOLERANCE_GRAD,
             tolerance_change=self.LBFGS_TOLERANCE_ABS,
-            line_search_fn="strong_wolfe"
+            line_search_fn="strong_wolfe",
         )
 
-        norm_constant = torch.mean(self._data**2).detach()  # For normalizing the loss history
+        norm_constant = torch.mean(
+            self._data**2
+        ).detach()  # For normalizing the loss history
+
         def closure() -> torch.Tensor:
             current_optimizer.zero_grad()
             loss, fidelity, *_ = self._objective(self._solution)
