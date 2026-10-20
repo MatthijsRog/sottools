@@ -339,3 +339,67 @@ def test_mesh_to_grid_strip(seed):
     )
 
     assert np.allclose(signal[Nx // 2, :] / area, s_expected, rtol=1e-2, atol=1e-4)
+
+
+@pytest.mark.parametrize("phi", [0.0, 0.3, -0.8, 1.2, 2.8])
+def test_2d_biotsavart_bruteforce(phi):
+    """Finite, tilted, tapered loop vs direct Biot-Savart of a few current elements."""
+    N, dx = 80, 0.25
+    h, rho1, rho2 = 1.0, 0.4, 0.8
+    params = forward.Forward2DParameters(
+        Lx=N * dx, Ly=N * dx, Nx=N, Ny=N, rho1=rho1, rho2=rho2, height=h, phi=phi
+    )
+
+    # A few random current elements near the centre, with both components
+    rng = np.random.default_rng(0)
+    Jx, Jy = np.zeros((N, N)), np.zeros((N, N))
+    ix, iy = rng.integers(N // 2 - 4, N // 2 + 4, size=(2, 6))
+    Jx[ix, iy] = rng.uniform(-1, 1, 6)
+    Jy[ix, iy] = rng.uniform(-1, 1, 6)
+
+    signal = forward.Forward2DCurrent(params).forward(Jx, Jy)
+
+    # Sources as point current elements at pixel centres
+    X, Y = params.xx.numpy().astype(float), params.yy.numpy().astype(float)
+    isrc = np.nonzero(Jx**2 + Jy**2)
+    r_src = np.column_stack([X[isrc], Y[isrc], np.zeros(len(isrc[0]))])
+    J_src = np.column_stack([Jx[isrc], Jy[isrc], np.zeros(len(isrc[0]))])
+
+    # Loop: disk tilted about x by phi, in-plane axes x_hat and e, normal n
+    e = np.array([0.0, np.cos(phi), -np.sin(phi)])
+    n = np.array([0.0, np.sin(phi), np.cos(phi)])
+
+    # Quadrature weights: trapezoid in alpha; Gauss-Legendre in rho split at rho1.
+    # Each weight includes rho * W(rho).
+    n_alpha = 256
+    alpha = 2 * np.pi * np.arange(n_alpha) / n_alpha
+    x, w = np.polynomial.legendre.leggauss(32)
+    r_in = 0.5 * rho1 * (1 + x)
+    r_out = rho1 + 0.5 * (rho2 - rho1) * (1 + x)
+    rho = np.concatenate([r_in, r_out])
+    w_rho = np.concatenate(
+        [
+            0.5 * rho1 * w * r_in,
+            0.5 * (rho2 - rho1) * w * r_out * (rho2 - r_out) / (rho2 - rho1),
+        ]
+    )
+    A, R = np.meshgrid(alpha, rho, indexing="ij")
+    dA = (2 * np.pi / n_alpha) * w_rho[None, :]
+    loop = R[..., None] * (
+        np.cos(A)[..., None] * np.array([1.0, 0, 0]) + np.sin(A)[..., None] * e
+    )  # (Na, Nr, 3)
+
+    # Direct Biot-Savart flux at SQUID positions in the central patch
+    patch = slice(N // 2 - 12, N // 2 + 12, 2)
+    ref = np.zeros((N, N))
+    for i in range(N)[patch]:
+        for j in range(N)[patch]:
+            r0 = np.array([X[i, j], Y[i, j], h])
+            p = r0 + loop[:, :, None, :] - r_src  # (Na, Nr, Ns, 3)
+            integrand = (np.cross(J_src, p) @ n) / np.linalg.norm(p, axis=-1) ** 3
+            ref[i, j] = (
+                1e-1 * dx**2 * np.sum(dA[..., None] * integrand)
+            )  # mu0/4pi = 0.1
+
+    err = np.max(np.abs(signal[patch, patch] - ref[patch, patch]))
+    assert err < 1e-2 * np.max(np.abs(ref[patch, patch]))

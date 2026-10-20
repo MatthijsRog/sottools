@@ -666,6 +666,9 @@ class LondonSolver:
         The mesh on which to solve the London equation.
     Pearllength: float
         The Pearl length of the superconductor, in the same units as the mesh.
+    B_ext: float
+        The external magnetic field applied to the superconductor, in the same
+        units as the mesh. The field is uniform and out-of-plane. Defaults to 0.0.
     verbose: bool
         If true, debug messages are printed to console. Defaults to False.
 
@@ -682,10 +685,12 @@ class LondonSolver:
         self,
         mesh: SimplyConnectedCurrentMesh,
         Pearllength: float,
+        B_ext: float = 0.0,
         verbose: bool = False,
     ):
         self.mesh = mesh
         self.Pearllength = Pearllength
+        self.B_ext = B_ext
         self.verbose = verbose
 
         # Precompute matrices Cx and Cy
@@ -752,13 +757,12 @@ class LondonSolver:
         cell centers
         """
         # Initial streamfunction is just the solution without magnetic feedback
-        g = self._solve_streamfunction(
-            left_bc, right_bc, Bz=np.zeros(self.mesh.vertices.shape[0])
-        )
+        Bz_initial = np.ones(self.mesh.vertices.shape[0]) * self.B_ext
+        g = self._solve_streamfunction(left_bc, right_bc, Bz=Bz_initial)
 
         # Initial field is the response to this streamfunction
         Kx, Ky = self.mesh.field_curl(g)
-        Bz = self._calculate_Bz(Kx, Ky)
+        Bz = self._calculate_Bz(Kx, Ky) + self.B_ext
 
         # Iteratively solve for streamfunction and field until convergence
         success = False
@@ -769,7 +773,7 @@ class LondonSolver:
             g_old = g.copy()
             g = g * (1 - alpha) + g_new * alpha
             Kx, Ky = self.mesh.field_curl(g)
-            Bz = self._calculate_Bz(Kx, Ky)
+            Bz = self._calculate_Bz(Kx, Ky) + self.B_ext
             if self.verbose:
                 print(
                     f"Iteration {i + 1} completed in "
@@ -1041,6 +1045,126 @@ class HydroSolver:
             "converged": did_converge,
             "streamfunction": g,
             "vorticity": omega,
+            "Kx": Kx,
+            "Ky": Ky,
+        }
+
+        return res
+
+
+class InhomogeneousOhmicSolver:
+    """Solver for the inhomgeneous Ohm's law in a simply connected geometry.
+
+    Solves for the current flow in a metal of inhomgeneous resistivity rho(x,y). In the
+    streamline formalism, Ohm's law E = rho J then becomes
+
+    rho nabla^2 g + (nabla rho) dot (nabla g) = 0
+
+    The normal stiffness matrix K_ij has elements int dA (nabla phi_i) dot (nabla
+    phi_j). In this case, we introduce a new stiffness matrix K_ij^rho with elements
+    int dA rho(x,y) (nabla phi_i) dot (nabla phi_j). Approximating rho as constant over
+    each triangle t, with area A_t, this matrix becomes tractable.
+
+    In weak form, we then obtain
+
+    K^rho,FF g_F = -K^rho,FD g_D
+
+    Which can be solved through standard methods.
+
+    Parameters
+    ----------
+    mesh: SimplyConnectedCurrentMesh
+        The mesh on which to solve the inhomogeneous Ohm's law.
+    rho: np.ndarray
+        The resistivity at each triangle. Shape (N_t,).
+    verbose: bool, optional
+        If true, debug messages are printed to console. Defaults to False.
+    """
+
+    def __init__(
+        self,
+        mesh: SimplyConnectedCurrentMesh,
+        rho: np.ndarray,
+        verbose: bool = False,
+    ) -> None:
+        assert rho.shape[0] == mesh.triangles.shape[0], (
+            "Resistivity array must have the same length as the number of triangles in "
+            "the mesh."
+        )
+
+        self.mesh = mesh
+        self.rho = rho
+        self.verbose = verbose
+
+        # Precompute the resistivity-weighted stiffness matrix
+        self.K_rho = self._compute_resistivity_weighted_stiffness_matrix()
+
+    def _compute_resistivity_weighted_stiffness_matrix(self) -> scipy.sparse.csr_matrix:
+        """Compute the resistivity-weighted stiffness matrix K^rho.
+
+        Returns
+        -------
+        K_rho: scipy.sparse.csr_matrix
+            The resistivity-weighted stiffness matrix. Shape (N_v, N_v).
+        """
+        N_v = self.mesh.vertices.shape[0]
+        local_K_rho = np.einsum(
+            "tiu,tju->tij", self.mesh.shapegradients, self.mesh.shapegradients
+        ) * (self.rho[:, None, None] * self.mesh.areas[:, None, None])  # (N_t, 3, 3)
+
+        rows = self.mesh.triangles[:, :, None].repeat(3, axis=2)  # (N_t, 3, 3)
+        cols = self.mesh.triangles[:, None, :].repeat(3, axis=1)  # (N_t, 3, 3)
+        K_rho = scipy.sparse.coo_matrix(
+            (local_K_rho.ravel(), (rows.ravel(), cols.ravel())), shape=(N_v, N_v)
+        ).tocsr()
+
+        return K_rho
+
+    def solve(
+        self,
+        left_bc: float,
+        right_bc: float,
+    ) -> dict[str, np.ndarray]:
+        """Solve the inhomogeneous Ohm's law for a given mesh and resistivity.
+
+        Parameters
+        ----------
+        left_bc: float
+            The Dirichlet boundary condition on the left boundary.
+        right_bc: float
+            The Dirichlet boundary condition on the right boundary.
+
+        Returns
+        -------
+        res: dict[str, np.ndarray]
+            A dictionary containing the results of the solver, including:
+            - "streamfunction": np.ndarray, the streamfunction values
+            - "Kx": np.ndarray, the x-component of the sheet current density
+            - "Ky": np.ndarray, the y-component of the sheet current density
+        """
+        N_v = self.mesh.vertices.shape[0]
+
+        g_prescribed = np.zeros(N_v)
+        g_prescribed[self.mesh.dirichletleft_mask] = left_bc
+        g_prescribed[self.mesh.dirichletright_mask] = right_bc
+        g_D = g_prescribed[self.mesh.dirichlet_idx]
+
+        rhs_boundary = -self.K_rho[self.mesh.free_idx][:, self.mesh.dirichlet_idx] @ g_D
+
+        # Solve for free vertices
+        K_rho_free = self.K_rho[self.mesh.free_idx][:, self.mesh.free_idx]
+        K_rho_free = K_rho_free.tocsc()  # Convert to CSC format for spsolve
+        g_free = scipy.sparse.linalg.spsolve(K_rho_free, rhs_boundary)
+
+        # Combine free and Dirichlet values
+        g = np.zeros(N_v)
+        g[self.mesh.free_idx] = g_free
+        g[self.mesh.dirichlet_idx] = g_D
+
+        Kx, Ky = self.mesh.field_curl(g)
+
+        res = {
+            "streamfunction": g,
             "Kx": Kx,
             "Ky": Ky,
         }

@@ -18,14 +18,18 @@ build/
 .ipynb_checkpoints/
 
 # Project-specific: keep these OFF GitHub
+scratch
 scratch/
 notebooks/private/
 data/
 *.h5
 *.hdf5
 *.dat
+examples
 examples/
 *.asc
 *.csv
 *.txt
 docs/_build/
+docs/tutorials/illustrations/
+docs/tutorials/thesis_fig_data/

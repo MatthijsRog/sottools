@@ -25,7 +25,7 @@ def test_oversampled1dinversion(oversampledinverter1d_with_random_currents):
 
 def test_2dinversion(inverter2d_with_uniform_current):
     inverter, streamfunction = inverter2d_with_uniform_current
-    res = inverter.fit(lr=1e-2, n_steps=1000)
+    res = inverter.fit(lr=1, n_steps=100)
     assert np.allclose(
         res["streamfunction"],
         streamfunction,
