@@ -27,10 +27,43 @@ installation
 tutorials/Tutorial_1DForward
 tutorials/Tutorial_1DBackward
 tutorials/Tutorial_1DCoinversion
+```
+
+## Two-dimensional calculations
+
+```{toctree}
+:maxdepth: 2
 tutorials/Tutorial_2DForward
 tutorials/Tutorial_2DBackward_Hydro
 tutorials/Tutorial_2DBackward_InhomogeneousResistivity
 tutorials/Tutorial_2DBackward_Meissner
+```
+
+## Some notes on kernel computation
+
+```{toctree}
+:maxdepth: 2
 kernelmath
+kernelmath_2d
+```
+
+## API 
+
+```{toctree}
+:maxdepth: 2
 api/index
 ```
+
+## Citing SOTtools
+We are working on a preprint describing SOTtools. In the meantime, please cite the Github repository:
+```bibtex
+@misc{SOTtools,
+  author = {Matthijs Rog},
+  title = {SOTtools},
+  year = {2026},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {https://github.com/MatthijsRog/sottools/}
+}
+```
+Alternatively, you can cite [the original paper that sottools was built for](https://arxiv.org/abs/2606.20157).

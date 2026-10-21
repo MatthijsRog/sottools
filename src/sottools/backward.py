@@ -1803,6 +1803,39 @@ class Inverter2D:
         self._device = device
         self._lumped_mass = lumped_mass
 
+        self._initialize_mesh_properties(device, lumped_mass)
+
+        # Initial solution vector: [right-wall value, free-node values].
+        # The user supplies a full streamfunction (N_vertices,)
+        N_solution = 1 + int(np.sum(self._mesh.free_mask))
+        solution0 = torch.zeros(N_solution, dtype=DTYPE, device=device)
+        if initial_streamfunction is not None:
+            g0 = np.asarray(initial_streamfunction, dtype=float)
+            if g0.shape != (self._N_points,):
+                raise ValueError(
+                    f"initial_streamfunction must have shape ({self._N_points},), "
+                    f"got {g0.shape}."
+                )
+            if not np.allclose(g0[self._mesh.dirichletleft_mask], 0.0):
+                raise ValueError(
+                    "initial_streamfunction must be zero on the left Dirichlet "
+                    "boundary."
+                )
+            right_values = g0[self._mesh.dirichletright_mask]
+            if not np.allclose(right_values, right_values[0]):
+                raise ValueError(
+                    "initial_streamfunction must be constant on the right Dirichlet "
+                    "boundary."
+                )
+            solution0[0] = float(right_values[0])
+            solution0[1:] = torch.from_numpy(g0[self._mesh.free_mask]).to(
+                dtype=DTYPE, device=device
+            )
+        self._solution = torch.nn.Parameter(solution0)
+
+    def _initialize_mesh_properties(
+        self, device: torch.device, lumped_mass: bool
+    ) -> None:
         # Mesh properties
         self._N_points = len(self._mesh.vertices)
         self._N_free_vals = np.sum(self._mesh.free_mask)
@@ -1893,34 +1926,6 @@ class Inverter2D:
                 Kt_Minv_Kff_Minv_K
             )
             self._vorticity_matrix_dense = None
-
-        # Initial solution vector: [right-wall value, free-node values].
-        # The user supplies a full streamfunction (N_vertices,)
-        N_solution = 1 + int(np.sum(self._mesh.free_mask))
-        solution0 = torch.zeros(N_solution, dtype=DTYPE, device=device)
-        if initial_streamfunction is not None:
-            g0 = np.asarray(initial_streamfunction, dtype=float)
-            if g0.shape != (self._N_points,):
-                raise ValueError(
-                    f"initial_streamfunction must have shape ({self._N_points},), "
-                    f"got {g0.shape}."
-                )
-            if not np.allclose(g0[self._mesh.dirichletleft_mask], 0.0):
-                raise ValueError(
-                    "initial_streamfunction must be zero on the left Dirichlet "
-                    "boundary."
-                )
-            right_values = g0[self._mesh.dirichletright_mask]
-            if not np.allclose(right_values, right_values[0]):
-                raise ValueError(
-                    "initial_streamfunction must be constant on the right Dirichlet "
-                    "boundary."
-                )
-            solution0[0] = float(right_values[0])
-            solution0[1:] = torch.from_numpy(g0[self._mesh.free_mask]).to(
-                dtype=DTYPE, device=device
-            )
-        self._solution = torch.nn.Parameter(solution0)
 
     def _scipy_csr_to_torch_sparse(self, csr: scipy.sparse.csr_matrix) -> torch.Tensor:
         coo = csr.tocoo()
@@ -2137,3 +2142,1061 @@ class Inverter2D:
     def lam3(self, value: float) -> None:
         """Set the weight of vorticity regularization."""
         self._lam3 = value
+
+
+class Coinversion2D:
+    """Inverter for co-fitting the sensor parameters height and phi_eff.
+
+    Standard inversion simply minimizes the objective function, which consists of
+    fidelity and regularization. Co-inversion of current and kernel parameters is much
+    more complex, because there are various spurious attractors that give poor fits.
+    If the kernel parameters are directly optimized alongside the current, kernels that
+    allow for better-regularized currents will be preferred. For this reason, the
+    problem is approached in a bilevel scheme. Moreover, in presence of noise, narrower
+    kernels are preferred because they allow for overfitting. For this reason,
+    a cross validation scheme can be used (by setting crossvalidation_size > 1).
+
+    Parameters
+    ----------
+    meshtogrid: MeshToGrid
+        The mesh to grid converter that encapsulates the mesh and defines the
+        operation that converts the mesh to a grid for the forward model. It
+        is the user's responsibility to ensure the output of meshtogrid is
+        compatible with the forward model.
+    currentforward: Forward2DCurrent
+        The forward model that computes the SOT signal from the current
+        distribution on the mesh. It is the user's responsibility to ensure
+        the output of meshtogrid is compatible with the forward model.
+    data: np.ndarray
+        The SOT signal to fit, of shape (Nscan_y, Nscan_x).
+    lam1: float
+        Regularization weight for Tikhonov regularization on the
+        streamfunction.
+    lam2: float
+        Regularization weight for total variation regularization on the
+        current density.
+    lam3: float
+        Regularization weight for 3rd order Tikhonov regularization on the
+        streamfunction, equivalent to 1st order Tikhonov on the vorticity.
+    huber_e: float
+        Huber parameter for total variation regularization. Default is 1e-3.
+    initial_height : float, optional
+        The initial height parameter value. Default is 1.0.
+    initial_phi_eff : float, optional
+        The initial effective tilt angle in radians. Default is 0.0. This is the
+        scan-frame angle Forward2DParameters.phi_eff, i.e. -phi if
+        forward.params.invert_scan is True, and +phi otherwise.
+    crossvalidation_size : int, optional
+        The number of cross-validation splits. Default is 1. If larger than 1,
+        cross-validation is used to prevent overfitting.
+    convergence_checker : CoinversionConvergenceChecker | None, optional
+        The convergence checker to use. Default is None.
+    callback : FitCallback | None, optional
+        The callback to use during fitting. Default is None.
+    callback_every : int, optional
+        Call callback.on_step every callback_every sensor optimization steps.
+        Default is 1.
+    device : torch.device | None, optional
+        The device to use for computations. Default is None.
+    lr_sensor : float | LearningRateScheduler, optional
+        The learning rate for sensor parameters. Default is 1e-2. Learning rate
+        schedulers are deep-copied and therefore disjoint from any externally kept
+        reference.
+    lr_current : float | LearningRateScheduler, optional
+        The learning rate for current parameters. Default is 1.0. Learning rate
+        schedulers are deep-copied and therefore disjoint from any externally kept
+        reference.
+    cache_kernels : bool, optional
+        Whether to cache kernels. Default is True.
+    lumped_mass: bool, optional
+        Whether to use a lumped mass matrix for the Tikhonov regularization.
+        Default is False, however, on fine meshes, the lumped mass matrix is
+        many times faster, and lumped_mass=False can stall the inversion.
+    initial_streamfunction: np.ndarray, optional
+        Initial guess for the streamfunction, of shape (Nmesh_vertices,). If not
+        supplied, the initial guess is zero everywhere.
+    verbose : bool, optional
+        Whether to print verbose output. Default is False.
+
+    Notes
+    -----
+    These parameters have the constraint that height > rho2*|sin(phi_eff)| such
+    that the SQUID never crosses the sample plane. To incorporate this constraint, we
+    reparametrize the height parameter as h_free and write h = exp(h_free) + rho2*
+    |sin(phi_eff)|. The free parameter h_free is then optimized, and the constraint is
+    automatically satisfied.
+
+    crossvalidation_size: if >1, data is split into crossvalidation_size parts and
+    training+test seperation is used to prevent overfitting. See documentation for
+    further information.
+
+    Callback behaviour: in on_step, FitState1D.current is the current of fold 0
+    (fitted on the training set of fold 0 only), and predicted_signal is its
+    prediction on the full scan, so held-out points are included. on_step is not
+    called on the step at which convergence is detected. on_finish receives the
+    final current, fitted on the full dataset, and its prediction.
+
+    All angles, including the fitted sensor_parameters[3] and history.phi_history,
+    are phi_eff in radians (see initial_phi_eff).
+    """
+
+    LBFGS_MAXREPEATS = 10
+    LBFGS_TOLERANCE_GRAD = 1e-6
+    LBFGS_TOLERANCE_ABS = 1e-10
+
+    def __init__(
+        self,
+        meshtogrid: MeshToGrid,
+        currentforward: Forward2DCurrent,
+        data: np.ndarray,
+        lam1: float = 1e-7,  # Tikhonov-2 on streamfunction
+        lam2: float = 1e-9,  # TV on J
+        lam3: float = 1e-12,  # Tikhonov-3 on streamfunction
+        huber_e: float = 1e-3,
+        initial_height: float = 1.0,
+        initial_phi_eff: float = 0.0,
+        crossvalidation_size: int = 1,
+        convergence_checker: CoinversionConvergenceChecker | None = None,
+        callback: FitCallback | None = None,
+        callback_every: int = 1,
+        device: torch.device | None = None,
+        lr_sensor: float | LearningRateScheduler = 1e-2,
+        lr_current: float | LearningRateScheduler = 1.0,
+        cache_kernels: bool = True,
+        lumped_mass: bool = False,
+        initial_streamfunction: np.ndarray | None = None,
+        verbose: bool = False,
+    ):
+        if device is None:
+            device = torch.device("cpu")
+        self._meshtogrid = copy.deepcopy(meshtogrid)
+        self._mesh = self._meshtogrid.mesh
+        self._currentforward = copy.deepcopy(currentforward)
+        self._initial_currentforward = copy.deepcopy(currentforward)
+        self._data = torch.from_numpy(data).to(device, dtype=DTYPE)
+        self._lam1 = lam1
+        self._lam2 = lam2
+        self._lam3 = lam3
+        self._huber_e = huber_e
+        self._lam1_initial = lam1
+        self._lam2_initial = lam2
+        self._lam3_initial = lam3
+        self._huber_e_initial = huber_e
+        self._crossvalidation_size = crossvalidation_size
+        self._convergence_checker = convergence_checker
+        self._callback = callback
+        self._callback_every = callback_every
+        self._device = device
+        self._fitted_current: np.ndarray | None = None
+        self._cache_kernels = cache_kernels
+        self._lumped_mass = lumped_mass
+        self._initial_streamfunction = initial_streamfunction
+        self._verbose = verbose
+
+        self._folds = self._build_folds()
+
+        self._lr_current = lr_current
+        self._lr_current_initial = lr_current
+        self._lr_sensor = lr_sensor
+        self._lr_sensor_initial = lr_sensor
+        self._initial_phi_eff = initial_phi_eff
+        initial_relative_height = (
+            initial_height
+            - self._currentforward.params.rho2 * np.abs(np.sin(initial_phi_eff))
+        )
+        if initial_relative_height <= 0:
+            raise ValueError(
+                f"Initial height {initial_height} is too small for the "
+                f"given phi_eff {initial_phi_eff} and rho2 "
+                f"{self._currentforward.params.rho2}. Must satisfy height > rho2 "
+                f"* |sin(phi_eff)|."
+            )
+        self._initial_height_free = np.log(initial_relative_height)
+
+        self._initialize_mesh_properties(device, lumped_mass)
+
+        self.reset()
+
+    def _initialize_mesh_properties(
+        self, device: torch.device, lumped_mass: bool
+    ) -> None:
+        # Mesh properties
+        self._N_points = len(self._mesh.vertices)
+        self._N_free_vals = np.sum(self._mesh.free_mask)
+        self._N_solution = (
+            1 + self._N_free_vals
+        )  # 1 for the Dirichlet value on the right boundary
+        self._free_mask = torch.from_numpy(self._mesh.free_mask).to(device)
+        self._free_idx = torch.nonzero(self._free_mask, as_tuple=True)[0]
+        self._dirichlet_left_mask = torch.from_numpy(self._mesh.dirichletleft_mask).to(
+            device
+        )
+        self._dirichlet_right_mask = torch.from_numpy(
+            self._mesh.dirichletright_mask
+        ).to(device)
+        self._edge_lengths = torch.from_numpy(self._mesh.internaledgelengths).to(
+            device, dtype=DTYPE
+        )
+
+        # Tikhonov matrices
+        # This matrix is K^F,T M^FF,-1 K^F
+        self._tikhonov_matrix_dense: torch.Tensor | None = None
+        self._tikhonov_matrix_sparse: torch.Tensor | None = None
+        self._stiffness_matrix = self._mesh.stiffness_matrix
+        self._mass_matrix = scipy.sparse.csr_matrix(self._mesh.mass_matrix)
+        K_rows_free = self._stiffness_matrix[self._mesh.free_idx, :]  # (N_free, N_all)
+        if not lumped_mass:
+            Mff = scipy.sparse.csr_matrix(
+                self._mass_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
+            )  # (N_free, N_free)
+            Kt_Minv_K = (
+                K_rows_free.tocsc()
+                .transpose()
+                .dot(scipy.sparse.linalg.spsolve(Mff, K_rows_free.tocsc()))
+            )  # (N_all, N_all)
+            self._tikhonov_matrix_dense = torch.from_numpy(Kt_Minv_K.toarray()).to(
+                device, dtype=DTYPE
+            )
+            self._tikhonov_matrix_sparse = None
+        else:
+            # Lump by make each diagnonal element the row sum
+            Mff = scipy.sparse.csr_matrix(
+                self._mass_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
+            )  # (N_free, N_free)
+            Mff_diag = np.array(Mff.sum(axis=1)).flatten()  # (N_free,)
+            Kt_Minv_K = K_rows_free.T @ (
+                scipy.sparse.diags(1.0 / Mff_diag) @ K_rows_free
+            )
+            self._tikhonov_matrix_sparse = self._scipy_csr_to_torch_sparse(Kt_Minv_K)
+            self._tikhonov_matrix_dense = None
+
+        # TV matrices
+        DGx = (
+            self._mesh.edgedifference_operator @ self._mesh.gradient_operator_x
+        ).tocoo()
+        self._DGx = self._scipy_csr_to_torch_sparse(DGx)
+        DGy = (
+            self._mesh.edgedifference_operator @ self._mesh.gradient_operator_y
+        ).tocoo()
+        self._DGy = self._scipy_csr_to_torch_sparse(DGy)
+
+        # Vortex regularization matrices
+        # This matrix has the shape (K^F)^T M^FF,-1 K^FF M^FF,-1 K^F
+        # M^FF,-1 can be used exact or lumped.
+        Kf = K_rows_free
+        Kff = self._stiffness_matrix[np.ix_(self._mesh.free_idx, self._mesh.free_idx)]
+        self._vorticity_matrix_dense: torch.Tensor | None = None
+        self._vorticity_matrix_sparse: torch.Tensor | None = None
+        # Mff is already in memory from the Tikhonov calculation above
+        if not lumped_mass:
+            Kt_Minv_Kff_Minv_K = Kf.T @ (
+                scipy.sparse.linalg.spsolve(
+                    Mff, Kff @ scipy.sparse.linalg.spsolve(Mff, Kf)
+                )
+            )
+            self._vorticity_matrix_dense = torch.from_numpy(
+                Kt_Minv_Kff_Minv_K.toarray()
+            ).to(device, dtype=DTYPE)
+            self._vorticity_matrix_sparse = None
+        else:
+            Mff_diag = np.array(Mff.sum(axis=1)).flatten()  # (N_free,)
+            Kt_Minv_Kff_Minv_K = Kf.T @ (
+                scipy.sparse.diags(1.0 / Mff_diag)
+                @ Kff
+                @ scipy.sparse.diags(1.0 / Mff_diag)
+                @ Kf
+            )
+            self._vorticity_matrix_sparse = self._scipy_csr_to_torch_sparse(
+                Kt_Minv_Kff_Minv_K
+            )
+            self._vorticity_matrix_dense = None
+
+    def _scipy_csr_to_torch_sparse(self, csr: scipy.sparse.csr_matrix) -> torch.Tensor:
+        coo = csr.tocoo()
+        indices = torch.from_numpy(np.vstack([coo.row, coo.col]).astype(np.int64))
+        values = torch.from_numpy(coo.data).to(dtype=DTYPE)
+        return torch.sparse_coo_tensor(
+            indices, values, size=coo.shape, device=self._device
+        ).coalesce()
+
+    def _build_folds(self) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Build the (training, test) boolean masks for every cross-validation fold.
+
+        Fold i leaves out every K-th scan point starting at index i; those points form
+        the test set, the rest the training set. Each scan point is in exactly one
+        test set. K=1 is the full fit: training and test are both the entire scan.
+        """
+        # TODO: make 2D instead of 1D folds for the gridded signals.
+
+        n_points = self._data.shape[0]
+        k = self._crossvalidation_size
+        folds = []
+        for i in range(k):
+            training = torch.ones(n_points, dtype=torch.bool, device=self._device)
+            if k == 1:
+                test = training.clone()
+            else:
+                training[i::k] = False
+                test = ~training
+            folds.append((training, test))
+        return tuple(folds)
+
+    def _full_sensor_parameters(self, free_parameters: torch.Tensor) -> torch.Tensor:
+        # Assemble the full sensor parameters tensor from the free parameters
+        return torch.stack(
+            [
+                torch.exp(free_parameters[0])
+                + self._currentforward.params.rho2
+                * torch.abs(torch.sin(free_parameters[1])),
+                torch.tensor(
+                    self._currentforward.params.rho1, device=self._device, dtype=DTYPE
+                ),
+                torch.tensor(
+                    self._currentforward.params.rho2, device=self._device, dtype=DTYPE
+                ),
+                free_parameters[1],
+            ]
+        )
+
+    def _solution_to_streamvector(self, solution: torch.Tensor) -> torch.Tensor:
+        N_points = len(self._mesh.vertices)
+
+        streamvector = torch.zeros(N_points, dtype=solution.dtype, device=self._device)
+        streamvector[self._free_mask] = solution[1:]
+        streamvector[self._dirichlet_left_mask] = 0.0
+        streamvector[self._dirichlet_right_mask] = solution[0]
+        return streamvector
+
+    def _signal(
+        self,
+        streamvector: torch.Tensor,
+        full_sensor_parameters: torch.Tensor,
+        use_cached_kernels: bool = False,
+    ) -> torch.Tensor:
+        return self._currentforward.forward_t(
+            *self._meshtogrid.streamfunction_to_currents_t(streamvector),
+            full_sensor_parameters if not use_cached_kernels else None,
+        )
+
+    def _fidelity(
+        self,
+        streamvector: torch.Tensor,
+        full_sensor_parameters: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        use_cached_kernels: bool = False,
+    ) -> torch.Tensor:
+        signal = self._signal(
+            streamvector, full_sensor_parameters, use_cached_kernels=use_cached_kernels
+        )
+        if mask is not None:
+            signal = signal[mask]
+            data = self._data[mask]
+        else:
+            data = self._data
+        residual_norm: torch.Tensor = torch.linalg.norm(
+            signal - data
+        )  # TODO: change to mse_loss for consistency.
+        return residual_norm.pow(2)
+
+    def _tikhonov_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
+        """Tikhonov regularization on the streamfunction.
+
+        For a mass matrix M and a stiffness matrix K, the Tikhonov regularizer
+        is given by: R = streamvector^T K^T M^-1 K streamvector. We should
+        only weigh interior nodes, however, so that the total current can
+        freely change.
+        """
+        if self._lumped_mass and self._tikhonov_matrix_sparse is not None:
+            return torch.dot(streamvector, self._tikhonov_matrix_sparse @ streamvector)
+        elif self._tikhonov_matrix_dense is not None:
+            return torch.dot(streamvector, self._tikhonov_matrix_dense @ streamvector)
+        else:
+            raise ValueError(
+                "Tikhonov regularization matrix is not defined. This indicates a "
+                "problem in the module. Raise an issue on GitHub."
+            )
+
+    def _tv_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
+        """Total variation regularization on the current density J.
+
+        The TV regularizer is given by: R = sum_e l_e ||J_e||
+        Here J_e is the jump in the current density over edge e with length l_e
+        """
+        jump_x = self._DGx @ streamvector
+        jump_y = self._DGy @ streamvector
+        jump_mag_sq = jump_x**2 + jump_y**2
+        huber_mag = torch.where(
+            jump_mag_sq < self._huber_e**2,
+            0.5 * jump_mag_sq / self._huber_e,
+            torch.sqrt(jump_mag_sq.clamp(min=self._huber_e**2)) - 0.5 * self._huber_e,
+        )
+
+        return torch.dot(self._edge_lengths, huber_mag)
+
+    def _vorticity_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
+        if self._vorticity_matrix_sparse is not None:
+            return torch.dot(streamvector, self._vorticity_matrix_sparse @ streamvector)
+        elif self._vorticity_matrix_dense is not None:
+            return torch.dot(streamvector, self._vorticity_matrix_dense @ streamvector)
+        else:
+            raise ValueError(
+                "Vorticity regularization matrix is not defined. This indicates a "
+                "problem in the module. Raise an issue on GitHub."
+            )
+
+    def _total_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
+        return (
+            self._lam1 * self._tikhonov_regularization(streamvector)
+            + self._lam2 * self._tv_regularization(streamvector)
+            + self._lam3 * self._vorticity_regularization(streamvector)
+        )
+
+    def _objective(
+        self,
+        solution: torch.Tensor,
+        sensor_parameters_free: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        use_cached_kernels: bool = False,  # If True, cached kernels get used, however,
+        # this can only work if the sensor parameters are static.
+    ) -> torch.Tensor:
+        streamvector = self._solution_to_streamvector(solution)
+        full_sensor_parameters = self._full_sensor_parameters(sensor_parameters_free)
+        fidelity = self._fidelity(
+            streamvector,
+            full_sensor_parameters,
+            mask,
+            use_cached_kernels=use_cached_kernels,
+        )
+        reg = self._total_regularization(streamvector)
+        return fidelity + reg
+
+    def _all_loss_terms(
+        self,
+        solutions: list[torch.Tensor],
+        sensor_parameters_free: torch.Tensor,
+    ) -> tuple[float, dict[str, float], float, float]:
+        # Per fold f with current c_f:
+        #   fidelity  = sum_f F_test,f(c_f)              (CV score, the outer criterion)
+        #   reg       = sum_f R(c_f)
+        #   objective = sum_f [F_train,f(c_f) + R(c_f)]  (summed inner objectives)
+        # At K=1 (train = test = all) these reduce to F, R and F + R.
+        sensor_params = self._full_sensor_parameters(sensor_parameters_free.detach())
+        fidelity = 0.0
+        train_fidelity = 0.0
+        regterms: dict[str, float] = {
+            "tikhonov": 0.0,
+            "tv": 0.0,
+            "vorticity": 0.0,
+        }
+        for solution, (training_set_mask, test_set_mask) in zip(
+            solutions, self._folds, strict=True
+        ):
+            sol = solution.detach()
+            sv = self._solution_to_streamvector(sol)
+            fidelity += self._fidelity(sv, sensor_params, test_set_mask).item()
+            train_fidelity += self._fidelity(
+                sv, sensor_params, training_set_mask
+            ).item()
+            regterms["tikhonov"] += (
+                self._tikhonov_regularization(sv).item() * self._lam1
+            )
+            regterms["tv"] += self._tv_regularization(sv).item() * self._lam2
+            regterms["vorticity"] += (
+                self._vorticity_regularization(sv).item() * self._lam3
+            )
+        reg = sum(regterms.values())
+        obj = train_fidelity + reg
+        return fidelity, regterms, reg, obj
+
+    def _make_fit_state(self, total_steps: int) -> FitState1D:
+        fidelity, regterms, reg, obj = self._all_loss_terms(
+            self._solutions, self._sensor_parameters_free
+        )
+        return FitState1D(
+            step=self._parameter_optimizer_step,
+            total_steps=total_steps,
+            loss=obj,
+            fidelity=fidelity,
+            regularization=reg,
+            regularization_terms=regterms,
+            current=None,  # TODO: change this to some sort of best-fit streamfunction
+            predicted_signal=self.prediction,
+            to_fit_signal=self.data,
+            xaxis_current=self.ydevice,  # TODO: find alternatives for these x axes
+            xaxis_signal=self.yscan,
+            sensor_parameters=self.sensor_parameters,
+        )
+
+    def fit(
+        self,
+        n_steps_sensor: int = 500,
+        n_steps_current: int = 200,
+    ) -> dict[str, Any]:
+        """Perform or continue a full co-inversion of the dataset.
+
+        If the fit has not been started, fits until convergence is reached, or until
+        n_steps_sensor sensor optimization steps have been performed. If the fit has
+        already been started (and reset() has not been called), continues where was
+        left off.
+
+        Parameters
+        ----------
+        n_steps_sensor : int, optional
+            The number of sensor optimization steps to perform. Default is 500.
+        n_steps_current : int, optional
+            The number of current optimization steps to perform for each sensor
+            optimization step. Default is 200.
+
+        Returns
+        -------
+        dict[str, Any]
+            A short fit report, containing the following keys:
+            - "message" (str): A message indicating the reason for stopping the fit.
+            - "steps" (int): The number of sensor optimization steps performed.
+            - "steps_total" (int): The total number of sensor optimization steps
+              performed since the last reset.
+            - "final_sensor_parameters" (np.ndarray): The final sensor parameters after
+              the fit, of shape (4,).
+        """
+        optimize_current_times = []
+        calculate_v_times = []
+        optimize_sensor_times = []
+        history_times = []
+
+        n_steps_start = self._parameter_optimizer_step
+
+        did_converge = False
+
+        while self._parameter_optimizer_step - n_steps_start < n_steps_sensor:
+            # Update learning rate for the sensor based on the scheduler.
+            lr_sensor = self._get_lr_sensor(self._parameter_optimizer_step)
+            lr_current = self._get_lr_current(self._parameter_optimizer_step)
+
+            self._parameter_optimizer.param_groups[0]["lr"] = lr_sensor
+
+            # Step 1: for each training set, optimize the current with sensor parameters
+            # fixed.
+            start_time = time.perf_counter()
+            if self._cache_kernels:
+                self._cache_kernels_into_forward(
+                    self._sensor_parameters_free, self._currentforward
+                )
+            self._optimize_solutions_fixed_sensor(
+                self._solutions,
+                self._sensor_parameters_free,
+                n_steps_current,
+                lr_current,
+            )
+            optimize_current_times.append(time.perf_counter() - start_time)
+            start_time = time.perf_counter()
+            vs = self._calculate_vs_at_fixed_point(
+                self._solutions, self._sensor_parameters_free
+            )
+            calculate_v_times.append(time.perf_counter() - start_time)
+
+            # Now we record the history:
+            start_time = time.perf_counter()
+            fidelity, regterms, reg, obj = self._all_loss_terms(
+                self._solutions, self._sensor_parameters_free
+            )
+            sp = self._full_sensor_parameters(self._sensor_parameters_free.detach())
+            height, phi_eff = sp[0].item(), sp[3].item()
+            self._history.append(fidelity, regterms, reg, obj, height, phi_eff)
+
+            do_callback = self._callback is not None and (
+                (self._parameter_optimizer_step + 1) % self._callback_every == 0
+            )
+            if do_callback:
+                # Sensor parameters are not yet updated in this step, so the cached
+                # kernel (if any) still matches sp: one cheap FFT convolution.
+                with torch.no_grad():
+                    sol0 = self._solutions[0].detach()
+                    sv0 = self._solution_to_streamvector(sol0)
+                    prediction_fold0 = self._signal(
+                        sv0, sp, use_cached_kernels=self._cache_kernels
+                    )
+                state = FitState1D(
+                    step=self._parameter_optimizer_step,
+                    total_steps=n_steps_start + n_steps_sensor,
+                    loss=obj,
+                    fidelity=fidelity,
+                    regularization=reg,
+                    regularization_terms=regterms,
+                    current=None,  # TODO: change this to some sort of best-fit streamfunction
+                    predicted_signal=prediction_fold0.cpu().numpy(),
+                    to_fit_signal=self.data,
+                    xaxis_current=self.ydevice,  # TODO: find alternatives for these x axes
+                    xaxis_signal=self.yscan,
+                    sensor_parameters=sp.cpu().numpy(),
+                )
+            history_times.append(time.perf_counter() - start_time)
+
+            start_time = time.perf_counter()
+            self._optimize_sensor_fixed_streamvector(
+                self._solutions,
+                self._sensor_parameters_free,
+                self._parameter_optimizer,
+                vs,
+            )
+            optimize_sensor_times.append(time.perf_counter() - start_time)
+
+            self._parameter_optimizer_step += 1
+
+            # Check for convergence if a checker is provided
+            if self._convergence_checker is not None:
+                if self._convergence_checker.check(self._history):
+                    if self._verbose:
+                        print(
+                            f"Convergence reached at sensor optimization step "
+                            f"{self._parameter_optimizer_step}."
+                        )
+                    did_converge = True
+                    break
+
+            # Perform live callback
+            if do_callback:
+                assert self._callback is not None
+                self._callback.on_step(state)
+
+        # Now that we are done, we have the proper fixed parameters to calculate the
+        # current one last time. Soft start from the average current:
+        if self._cache_kernels:
+            self._cache_kernels_into_forward(
+                self._sensor_parameters_free, self._currentforward
+            )
+        solution = (
+            torch.mean(torch.stack(self._solutions), dim=0)
+            .detach()
+            .requires_grad_(True)
+        )
+        full_data_mask = torch.ones(
+            self._data.shape[0], dtype=torch.bool, device=self._device
+        ) # TODO: rewrite for 2D
+        self._optimize_single_solution_fixed_sensor(
+            solution,
+            self._sensor_parameters_free,
+            n_steps_current,
+            self._get_lr_current(self._parameter_optimizer_step),
+            full_data_mask,
+        )
+        self._fitted_solution = solution.detach()
+
+        # We are done, so call the finish callback if provided
+        if self._callback is not None:
+            state = self._make_fit_state(
+                total_steps=n_steps_start + n_steps_sensor,
+            )
+            self._callback.on_finish(state)
+
+        # Summarize timings
+        if self._verbose and optimize_current_times:
+            print("FIT FINISHED --- TIMING SUMMARY")
+            print(
+                f"CURRENT DETERMINATION --- \tAverage: {
+                    np.mean(optimize_current_times):.4f} s\t"
+                f"Max: {np.max(optimize_current_times):.4f} s\t"
+                f"Min: {np.min(optimize_current_times):.4f}\t"
+                f"Total: {np.sum(optimize_current_times):.4f} s"
+            )
+            print(
+                f"V CALCULATION --- \tAverage: {np.mean(calculate_v_times):.4f} s\t"
+                f"Max: {np.max(calculate_v_times):.4f} s\t"
+                f"Min: {np.min(calculate_v_times):.4f}\t"
+                f"Total: {np.sum(calculate_v_times):.4f} s"
+            )
+            print(
+                f"SENSOR DETERMINATION --- \tAverage: {
+                    np.mean(optimize_sensor_times):.4f} s\t"
+                f"Max: {np.max(optimize_sensor_times):.4f} s\t"
+                f"Min: {np.min(optimize_sensor_times):.4f}\t"
+                f"Total: {np.sum(optimize_sensor_times):.4f} s"
+            )
+            print(
+                f"HISTORY RECORDING --- \t\tAverage: {np.mean(history_times):.4f} s\t"
+                f"Max: {np.max(history_times):.4f} s\t"
+                f"Min: {np.min(history_times):.4f}\t"
+                f"Total: {np.sum(history_times):.4f} s"
+            )
+
+        # At the end, return a small dictionary reporting the final state
+        final_sensor_params = self.sensor_parameters
+        nsteps = self._parameter_optimizer_step - n_steps_start
+        stopreason = "converged" if did_converge else "max_steps_reached"
+        return {
+            "message": stopreason,
+            "steps": nsteps,
+            "steps_total": self._parameter_optimizer_step,
+            "final_sensor_parameters": final_sensor_params,
+        }
+
+    def _optimize_sensor_fixed_streamvector(
+        self,
+        solutions: list[torch.Tensor],
+        sensor_parameters_free: torch.Tensor,
+        parameter_optimizer: torch.optim.Optimizer,
+        vs: list[torch.Tensor],
+    ) -> None:
+        # Without CV, one calculates the surrogate F - Lcurr * v
+        # With CV, one has as many vs as folds, and as many surrogates as folds
+        # One then calculates for the ith surrogate F - Lcurr * v using:
+        # - for F, the test set i
+        # - for Lcurr, the training set i
+        # - the ith calculated v (which comes from test set i)
+        surrogates = []
+        sensorparams = self._full_sensor_parameters(sensor_parameters_free)
+        for i in range(self._crossvalidation_size):
+            training_set_mask, test_set_mask = self._folds[i]
+            sol = solutions[i].clone().detach().requires_grad_(True)  # Something to
+            # take derivatives with respect to.
+            F_test = self._fidelity(
+                self._solution_to_streamvector(sol), sensorparams, test_set_mask
+            )
+            F_train = self._fidelity(
+                self._solution_to_streamvector(sol), sensorparams, training_set_mask
+            )
+            Lsv = torch.autograd.grad(
+                F_train
+                + regularizer(  # TODO: fix this regularizer reference...
+                    self._solution_to_streamvector(sol)
+                ),
+                sol,
+                create_graph=True,
+            )[0]
+            surrogate = F_test - (Lsv * vs[i]).sum()
+            surrogates.append(surrogate)
+        composite_surrogate: torch.Tensor = torch.stack(surrogates).sum()
+        parameter_optimizer.zero_grad()
+        composite_surrogate.backward(inputs=sensor_parameters_free)  # type: ignore[no-untyped-call]
+        parameter_optimizer.step()
+
+    def _calculate_vs_at_fixed_point(
+        self, solutions: list[torch.Tensor], sensor_parameters_free: torch.Tensor
+    ) -> list[torch.Tensor]:
+        # Calculates the "v" object at a fixed point in the optimization scheme. Final
+        # v is detached from the graph. Each fold gets its own "v" object (we return a
+        # list). Where v is calculated using only the TEST SET
+        vs = []
+        for i in range(self._crossvalidation_size):
+            training_set_mask, test_set_mask = self._folds[i]
+            v = self._calculate_single_v_at_fixed_point(
+                solutions[i],
+                sensor_parameters_free,
+                training_set_mask,
+                test_set_mask,
+            )
+            vs.append(v)
+        return vs
+
+    def _calculate_single_v_at_fixed_point(
+        self,
+        solutions: torch.Tensor,
+        sensor_parameters_free: torch.Tensor,
+        training_set_mask: torch.Tensor,
+        test_set_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # TODO: implement CG here because direct Hessian is too large
+        # Calculates the "v" object at a fixed point in the optimization scheme.
+        # Final v is detached from the graph.
+        # Where v is calculated using only the TEST SET
+        solution_fixed = solutions.detach()
+        sensor_params_fixed = self._full_sensor_parameters(
+            sensor_parameters_free
+        ).detach()
+        sol = solution_fixed.clone().requires_grad_(True)  # Something to take
+        # derivatives with respect to.
+        fsol = torch.autograd.grad(
+            self._fidelity(
+                self._solution_to_streamvector(sol),
+                sensor_params_fixed,
+                test_set_mask,
+                use_cached_kernels=self._cache_kernels,
+            ),
+            sol,
+        )[0]
+        hessian = torch.autograd.functional.hessian(
+            lambda s: (
+                self._fidelity(
+                    self._solution_to_streamvector(s),
+                    sensor_params_fixed,
+                    training_set_mask,
+                    use_cached_kernels=self._cache_kernels,
+                )
+                + regularizer(  # TODO: fix this regularizer reference...
+                    self._solution_to_streamvector(s)
+                )
+            ),
+            sol,
+            vectorize=True,
+        )  # type: ignore[no-untyped-call]
+        v: torch.Tensor = (
+            torch.linalg.solve(hessian.double(), fsol.double()).to(DTYPE).detach()
+        )
+        return v
+
+    def _optimize_solutions_fixed_sensor(
+        self,
+        solutions: list[torch.Tensor],
+        sensor_parameters_free: torch.Tensor,
+        n_steps_current: int,
+        lr_current: float,
+    ) -> None:
+        for i in range(self._crossvalidation_size):
+            training_set_mask, _ = self._folds[i]
+            self._optimize_single_solution_fixed_sensor(
+                solutions[i],
+                sensor_parameters_free,
+                n_steps_current,
+                lr_current,
+                training_set_mask,
+            )
+
+    def _cache_kernels_into_forward(
+        self, sensor_parameters_free: torch.Tensor, currentforward: Forward2DCurrent
+    ) -> None:
+        params = copy.deepcopy(currentforward.params)
+        full_params = self._full_sensor_parameters(sensor_parameters_free.detach())
+        h, phi_eff = full_params[0].item(), full_params[3].item()
+        params.height = h
+        params.phi = phi_eff if not params.invert_scan else -phi_eff
+        currentforward.params = (
+            params  # This automatically caches, .params is a @property.
+        )
+
+    def _optimize_single_solution_fixed_sensor(
+        self,
+        solution: torch.Tensor,
+        sensor_parameters_free: torch.Tensor,
+        n_steps_current: int,
+        lr_current: float,
+        training_set_mask: torch.Tensor | None = None,
+    ) -> None:
+        # Current must be leaf tensor with requires_grad=True
+        free_sensor_params_fixed = sensor_parameters_free.detach()
+        solution_optimizer = torch.optim.LBFGS(
+            [solution],
+            lr=lr_current,
+            max_iter=n_steps_current,
+            max_eval=n_steps_current * 5,
+            tolerance_grad=self.LBFGS_TOLERANCE_GRAD,
+            tolerance_change=self.LBFGS_TOLERANCE_ABS,
+            line_search_fn="strong_wolfe",
+        )
+
+        norm_constant = torch.mean(
+            self._data**2
+        ).detach()  # For normalizing the loss history
+
+        def closure() -> torch.Tensor:
+            solution_optimizer.zero_grad()
+            loss = self._objective(
+                solution,
+                free_sensor_params_fixed,
+                training_set_mask,
+                use_cached_kernels=self._cache_kernels,
+            )
+            normalized_loss = loss / norm_constant
+            normalized_loss.backward()  # type: ignore[no-untyped-call]
+            return normalized_loss
+
+        # As long as max_steps is reached, continue, to ensure we end up converged
+        st = solution_optimizer.state[solution]
+        n_before = 0  # fresh optimizer
+        solution_optimizer.step(closure)  # type: ignore[no-untyped-call]
+        nrepeats = 1
+        while st["n_iter"] - n_before == n_steps_current:
+            n_before = st["n_iter"]
+            solution_optimizer.step(closure)  # type: ignore[no-untyped-call]
+            nrepeats += 1
+            if nrepeats > self.LBFGS_MAXREPEATS:
+                warnings.warn(
+                    "LBFGS did not converge within the maximum number of repeats. "
+                    "Consider increasing n_steps_current or adjusting lr_current. "
+                    "Alternatively, perhaps the tolerance is set too strictly.",
+                    stacklevel=2,
+                )
+                break
+
+    def _get_lr_sensor(self, parameter_optimizer_step: int) -> float:
+        lr_sensor = (
+            self._lr_sensor(parameter_optimizer_step)
+            if isinstance(self._lr_sensor, LearningRateScheduler)
+            else self._lr_sensor
+        )
+        return lr_sensor
+
+    def _get_lr_current(self, parameter_optimizer_step: int) -> float:
+        lr_current = (
+            self._lr_current(parameter_optimizer_step)
+            if isinstance(self._lr_current, LearningRateScheduler)
+            else self._lr_current
+        )
+        return lr_current
+
+    def reset(self) -> None:
+        """Reset the state of the fit to return to the initial state.
+
+        Performs a true "factory reset" as if fit() was never run.
+        """
+        self._parameter_optimizer_step = 0
+        self._currentforward = copy.deepcopy(self._initial_currentforward)
+
+        self._lr_current = self._lr_current_initial
+        self._lam1 = self._lam1_initial
+        self._lam2 = self._lam2_initial
+        self._lam3 = self._lam3_initial
+        self._huber_e = self._huber_e_initial
+
+        N_solution = 1 + int(np.sum(self._mesh.free_mask))
+        solution0 = torch.zeros(N_solution, dtype=DTYPE, device=self._device)
+        if self._initial_streamfunction is not None:
+            g0 = np.asarray(self._initial_streamfunction, dtype=float)
+            if g0.shape != (self._N_points,):
+                raise ValueError(
+                    f"initial_streamfunction must have shape ({self._N_points},), "
+                    f"got {g0.shape}."
+                )
+            if not np.allclose(g0[self._mesh.dirichletleft_mask], 0.0):
+                raise ValueError(
+                    "initial_streamfunction must be zero on the left Dirichlet "
+                    "boundary."
+                )
+            right_values = g0[self._mesh.dirichletright_mask]
+            if not np.allclose(right_values, right_values[0]):
+                raise ValueError(
+                    "initial_streamfunction must be constant on the right Dirichlet "
+                    "boundary."
+                )
+            solution0[0] = float(right_values[0])
+            solution0[1:] = torch.from_numpy(g0[self._mesh.free_mask]).to(
+                dtype=DTYPE, device=self._device
+            )
+
+        # TODO: fill self._solutions with initial values solution0
+        self._solutions = [
+            torch.zeros(
+                self._currentforward.params.Ndevice,  # TODO: connect this to the mesh to get the real number of free nodes
+                requires_grad=True,
+                device=self._device,
+                dtype=DTYPE,
+            )
+            for _ in range(self._crossvalidation_size)
+        ]  # List of solutions, one predicted
+        # by each training set. The final prediction should be made by using the final
+        # kernel and fitting on a training set spanning the entire data set.
+        self._fitted_solution = None
+
+        # Initialize the free sensor parameters (height and phi_eff) with the provided
+        # initial values
+        self._sensor_parameters_free = torch.tensor(
+            [self._initial_height_free, self._initial_phi_eff],
+            requires_grad=True,
+            device=self._device,
+            dtype=DTYPE,
+        )
+        self._lr_sensor = self._lr_sensor_initial
+        lr_sensor = self._get_lr_sensor(
+            self._parameter_optimizer_step
+        )  # Should be 0 :)
+        self._parameter_optimizer = torch.optim.Adam(
+            [self._sensor_parameters_free], lr=lr_sensor
+        )
+
+        self._history = CoinversionFitHistory()
+
+    @property
+    def lr_sensor(self) -> float | LearningRateScheduler:
+        """The learning rate for the sensor parameters, potentially a scheduler."""
+        return self._lr_sensor
+
+    @lr_sensor.setter
+    def lr_sensor(self, value: float | LearningRateScheduler) -> None:
+        # Setting the learning rate to a float when a scheduler is provided
+        # should raise. However, changing the scheduler mid-run is allowed.
+        if isinstance(self._lr_sensor, LearningRateScheduler) and (
+            not isinstance(value, LearningRateScheduler)
+        ):
+            raise ValueError(
+                "Cannot set lr_sensor to a float when a "
+                "LearningRateScheduler is in use. Use a scheduler or set "
+                "the initial learning rate to a float."
+            )
+        self._lr_sensor = value
+
+    @property
+    def lr_current(self) -> float | LearningRateScheduler:
+        """The learning rate for the current optimization, potentially a scheduler."""
+        return self._lr_current
+
+    @lr_current.setter
+    def lr_current(self, value: float | LearningRateScheduler) -> None:
+        if isinstance(self._lr_current, LearningRateScheduler) and (
+            not isinstance(value, LearningRateScheduler)
+        ):
+            raise ValueError(
+                "Cannot set lr_current to a float when a "
+                "LearningRateScheduler is in use. Use a scheduler or set "
+                "the initial learning rate to a float."
+            )
+        self._lr_current = value
+
+    @property
+    def history(self) -> CoinversionFitHistory:
+        """The history of the fit."""
+        return self._history
+
+    @property
+    def sensor_parameters(self) -> np.ndarray:
+        """The fitted sensor parameters (height, rho1, rho2, phi_eff)."""
+        sps = self._full_sensor_parameters(self._sensor_parameters_free)
+        return np.copy(sps.detach().cpu().numpy())
+
+    @property
+    def solution(self) -> np.ndarray | None:
+        """The fitted solution calculated from the full dataset."""
+        if self._fitted_solution is None:
+            return None
+        else:
+            return self._fitted_solution.detach().cpu().numpy()
+
+    @property
+    def fitted_streamfucntion(self) -> np.ndarray | None:
+        """The fitted streamfunction calculated from the full dataset."""
+        if self._fitted_solution is None:
+            return None
+        return np.copy(
+            self._solution_to_streamvector(self._fitted_solution).detach().cpu().numpy()
+        )
+
+    # TODO: Coinversion1D had ydevice, yscan as nice getters to access mesh. Should add here too for plotting of solutions maybe. Or not, it was not used that much.
+
+    @property
+    def data(self) -> np.ndarray:
+        """The raw data meant to fit."""
+        return np.copy(self._data.detach().cpu().numpy())
+
+    @property
+    def prediction(self) -> np.ndarray:
+        """The predicted signal corresponding to the last-fit solution."""
+        if self.solution is None:
+            raise ValueError("No solution has been fitted yet. Call fit() first.")
+        with torch.no_grad():
+            sensorparams = self._full_sensor_parameters(self._sensor_parameters_free)
+            return np.copy(
+                self._signal(
+                    self._solution_to_streamvector(self._fitted_solution),
+                    sensorparams,
+                    use_cached_kernels=self._cache_kernels,
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+    @property
+    def convergence_checker(self) -> CoinversionConvergenceChecker | None:
+        """The object that checks for convergence of the fit."""
+        return self._convergence_checker
+
+    @convergence_checker.setter
+    def convergence_checker(self, value: CoinversionConvergenceChecker | None) -> None:
+        self._convergence_checker = value

@@ -6,14 +6,10 @@ calculation of SQUID microscopy signals from 1D and 2D current distributions.
 For kernel plotting functions, we refer to forwardplotting.py.
 """
 
-import math
-from collections.abc import Iterable
-
 import matplotlib.tri as mtri
 import numpy as np
 import torch
 from scipy import sparse
-from tqdm import tqdm
 
 from sottools.mesh import SimplyConnectedCurrentMesh
 
@@ -321,8 +317,6 @@ class Forward1D:
     mu0: float
         Permeability of free space. Sets the units of the problem. Default is 4*pi*1e-1
         which corresponds to units of um, uA, uT.
-    verbose: bool
-        If True, prints progress during kernel precomputation. Defaults to False.
 
     Notes
     -----
@@ -350,7 +344,6 @@ class Forward1D:
         self._params = params
         self._n_alpha = n_alpha
         self._device = device
-        self._verbose = verbose
         self._mu0 = mu0
 
         self._n_rho = n_rho
@@ -485,7 +478,10 @@ class Forward1D:
         # Offset by dalpha/2: the grid stays symmetric under
         # alpha -> alpha + pi for even n_alpha (needed for the invert_scan identity).
 
-        h, r1, r2, phi, gamma = (t.to(DTYPE) for t in (height, rho1, rho2, phi, gamma))
+        h, r1, r2, phi, gamma = (
+            t.to(dtype=DTYPE, device=self._device)
+            for t in (height, rho1, rho2, phi, gamma)
+        )
         if float(h.detach()) <= float(r2.detach()) * abs(np.sin(float(phi.detach()))):
             raise ValueError(
                 "SQUID loop intersects the sample: height <= rho2*|sin(phi)|."
@@ -794,16 +790,16 @@ class Forward2DCurrent:
 
     The forward model for 2D current reconstruction. An instance of this
     class uses Forward2DParameters to pre-compute the SQUID-response kernel
-    (Foward2DCurrent._precompute_kernel1 and Foward2DCurrent._precompute_kernel2) and
-    then uses this kernel to convert between a current distribution Jx/Jy on the device
-    and a SQUID signal S on the same grid.
+    (Foward2DCurrent._compute_kernels) and
+    then uses this kernel to convert between a current distribution Jx/Jy on the
+    device and a SQUID signal S on the same grid.
 
     The implementation contains an approach to minimize wrapping artifacts in the
     convolution:
     1. All convolutions are performed on a grid of size 3*Nx by 3*Ny to ensure
     sufficient padding protects against wrapping artifacts.
-    2. The current distributions are mirrored and extended over the entire 3*Nx by 3*Ny
-    grid to simulate continuity.
+    2. The current distributions are mirrored and extended over the entire 3*Nx by
+    3*Ny grid to simulate continuity.
     3. Outside the main FOV, the current distributions are tapered to zero using a
     cos(pi*x) window over half Nx/Ny to prevent faraway imaginary currents from
     contributing to the SQUID signal.
@@ -814,14 +810,17 @@ class Forward2DCurrent:
         An instance of Forward2DParameters containing the parameters for the
         forward model.
     n_alpha: int
-        Number of alpha angles to use in the kernel precomputation. Defaults to 32.
+        Number of alpha angles to use in the kernel precomputation. Defaults to 16.
+    n_rho: int
+        Number of rho values to use in the kernel precomputation. Defaults to 6.
+        This means that the 0 < rho < rho_1 part is evalauted on 6 Gauss-Legendre
+        points and the rho_1 < rho < rho_2 part is evaluated on 6 Gauss-Legendre
+        points.
     device: torch.device
         The device on which to perform all torch computations. Defaults to CPU.
     mu0: float
-        Permeability of free space. Sets the units of the problem. Default is 4*pi*1e-1
-        which corresponds to units of um, uA, uT.
-    verbose: bool
-        If True, prints progress during kernel precomputation. Defaults to False.
+        Permeability of free space. Sets the units of the problem. Default is
+        4*pi*1e-1 which corresponds to units of um, uA, uT.
 
     Notes
     -----
@@ -832,8 +831,8 @@ class Forward2DCurrent:
     def __init__(
         self,
         params: Forward2DParameters,
-        n_alpha: int = 32,
-        n_rho: int = 32,
+        n_alpha: int = 16,
+        n_rho: int = 6,
         device: torch.device | None = None,
         mu0: float = 4 * np.pi * 1e-1,
         verbose: bool = False,
@@ -841,15 +840,28 @@ class Forward2DCurrent:
         if device is None:
             device = torch.device("cpu")
 
+        if n_alpha % 2 != 0:
+            raise ValueError("n_alpha must be an even integer.")
+        if n_rho < 1:
+            raise ValueError("n_rho must be a positive integer.")
+
         self._params = params
         self._n_alpha = n_alpha
         self._n_rho = n_rho
         self._device = device
         self._mu0 = mu0
-        self._verbose = verbose
 
-        self._kernel1, self._kernel1_fft = self._precompute_kernel1()
-        self._kernel2, self._kernel2_fft = self._precompute_kernel2()
+        # Gauss-Legendre nodes and weights on [-1, 1]
+        x, w = np.polynomial.legendre.leggauss(n_rho)
+        self._gl_x = torch.as_tensor(x, dtype=DTYPE, device=self._device)
+        self._gl_w = torch.as_tensor(w, dtype=DTYPE, device=self._device)
+
+        # xxkernel / yykernel do not change and can thus be cached
+        self._xxkernel, self._yykernel = self._gridkernel()
+
+        self._kernel1, self._kernel1_fft, self._kernel2, self._kernel2_fft = (
+            self._compute_standard_kernels()
+        )
         self._window = self._precompute_window()
         self._xmap, self._ymap = self._precompute_reflect_maps()
 
@@ -866,147 +878,168 @@ class Forward2DCurrent:
         and reflection maps.
         """
         self._params = params
-        self._kernel1, self._kernel1_fft = self._precompute_kernel1()
-        self._kernel2, self._kernel2_fft = self._precompute_kernel2()
+        self._xxkernel, self._yykernel = self._gridkernel()
+        self._kernel1, self._kernel1_fft, self._kernel2, self._kernel2_fft = (
+            self._compute_standard_kernels()
+        )
         self._window = self._precompute_window()
         self._xmap, self._ymap = self._precompute_reflect_maps()
 
     def _gridkernel(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the kernel xx/yy axes on the 3*Nx by 3*Ny grid."""
-        xkernel = torch.zeros(3 * self._params.Nx)
+        xkernel = torch.zeros(3 * self._params.Nx, dtype=DTYPE, device=self._device)
         xkernel[: int(1.5 * self._params.Nx)] = torch.linspace(
             0,
             1.5 * self._params.Lx - self._params.Lx / self._params.Nx,
             int(1.5 * self._params.Nx),
+            dtype=DTYPE,
+            device=self._device,
         )
         xkernel[int(1.5 * self._params.Nx) :] = torch.linspace(
             -1.5 * self._params.Lx,
             -self._params.Lx / self._params.Nx,
             int(1.5 * self._params.Nx),
+            dtype=DTYPE,
+            device=self._device,
         )
 
-        ykernel = torch.zeros(3 * self._params.Ny)
+        ykernel = torch.zeros(3 * self._params.Ny, dtype=DTYPE, device=self._device)
         ykernel[: int(1.5 * self._params.Ny)] = torch.linspace(
             0,
             1.5 * self._params.Ly - self._params.Ly / self._params.Ny,
             int(1.5 * self._params.Ny),
+            dtype=DTYPE,
+            device=self._device,
         )
         ykernel[int(1.5 * self._params.Ny) :] = torch.linspace(
             -1.5 * self._params.Ly,
             -self._params.Ly / self._params.Ny,
             int(1.5 * self._params.Ny),
+            dtype=DTYPE,
+            device=self._device,
         )
 
         xxkernel, yykernel = torch.meshgrid(xkernel, ykernel, indexing="ij")
 
         return xxkernel, yykernel
 
-    def _kernel1_contribution(
-        self, xxkernel: torch.Tensor, yykernel: torch.Tensor, alpha: float, rho: float
-    ) -> torch.Tensor:
-        phi = self._params.phi_eff
-        h = self._params.height
+    def _compute_standard_kernels(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the SQUID response kernels for the current parameters object.
 
-        px = xxkernel + rho * math.cos(alpha)
-        py = yykernel - rho * math.sin(alpha) * math.cos(phi)
-        pz = h + rho * math.sin(alpha) * math.sin(phi)
-        p3 = (px**2 + py**2 + pz**2) ** 1.5
+        Returns
+        -------
+        kernel1: torch.Tensor
+            The SQUID response kernel for Jx in real space, shape (3*Nx, 3*Ny)
+        kernel1_fft: torch.Tensor
+            The SQUID response kernel for Jx in Fourier space, shape (3*Nx, 3*Ny)
+        kernel2: torch.Tensor
+            The SQUID response kernel for Jy in real space, shape (3*Nx, 3*Ny)
+        kernel2_fft: torch.Tensor
+            The SQUID response kernel for Jy in Fourier space, shape (3*Nx, 3*Ny)
+        """
 
-        return (math.cos(phi) * py - math.sin(phi) * pz) / p3
+        def T(v: float | torch.Tensor) -> torch.Tensor:
+            return torch.as_tensor(v, dtype=DTYPE, device=self._device)
 
-    def _kernel2_contribution(
-        self, xxkernel: torch.Tensor, yykernel: torch.Tensor, alpha: float, rho: float
-    ) -> torch.Tensor:
-        phi = self._params.phi_eff
-        h = self._params.height
-
-        px = xxkernel + rho * math.cos(alpha)
-        py = yykernel - rho * math.sin(alpha) * math.cos(phi)
-        pz = h + rho * math.sin(alpha) * math.sin(phi)
-        p3 = (px**2 + py**2 + pz**2) ** 1.5
-
-        return -math.cos(phi) * px / p3
-
-    def _precompute_kernel1(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Precompute the SQUID response kernel for the current parameters."""
-        n_alpha = self._n_alpha  # Alpha runs from zero to 2pi non-inclusive
-        n_rho = self._n_rho  # Rho runs from 0.5*rho2/n_rho to rho2-0.5*rho2/n_rho
-        # non-inclusive on both sides
-        xxkernel, yykernel = self._gridkernel()
-
-        kernel = torch.zeros((3 * self._params.Nx, 3 * self._params.Ny))
-
-        dalpha = 2 * np.pi / n_alpha
-        drho = self._params.rho2 / n_rho
-
-        alpha_iter: Iterable[torch.Tensor] = torch.linspace(
-            0.0, 2 * np.pi - dalpha, n_alpha
+        kernel1, kernel1_fft, kernel2, kernel2_fft = self._compute_kernels(
+            T(self._params.height),
+            T(self._params.rho1),
+            T(self._params.rho2),
+            T(self._params.phi_eff),
+            self._params.kernel1_sign,
+            self._params.kernel2_sign,
         )
-        if self._verbose:
-            print("Precomputing kernel...")
-            alpha_iter = tqdm(alpha_iter, desc="Kernel (alpha)")
-        rho_iter = torch.linspace(0.5 * drho, self._params.rho2 - 0.5 * drho, n_rho)
-        for alpha in alpha_iter:
-            for rho in rho_iter:
-                w = self._windowfunc(float(rho))
-                if w == 0.0:
-                    continue
 
-                # Calculate the contribution of this (alpha, rho) to the kernel
-                contribution = self._kernel1_contribution(
-                    xxkernel, yykernel, float(alpha), rho
-                )
+        return kernel1, kernel1_fft, kernel2, kernel2_fft
 
-                # Add the contribution to the kernel, weighted by the window function
-                kernel += rho * w * contribution * dalpha * drho
+    def _compute_kernels(
+        self,
+        height: torch.Tensor,
+        rho1: torch.Tensor,
+        rho2: torch.Tensor,
+        phi: torch.Tensor,
+        kernel1_sign: float,
+        kernel2_sign: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Precompute both SQUID response kernels for adjustable sensor parameters.
 
-        kernel = kernel * self._params.kernel1_sign
-
-        return kernel.to(self._device), torch.fft.fft2(kernel).to(self._device)
-
-    def _precompute_kernel2(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Precompute the SQUID response kernel for the current parameters."""
+        Sensor parameters: height, rho1, rho2, phi, kernel1_sign and kernel2_sign.
+        Parameters stay differentiable.
+        """
         n_alpha = self._n_alpha  # Alpha runs from zero to 2pi non-inclusive
-        n_rho = self._n_rho  # Rho runs from 0.5*rho2/n_rho to rho2-0.5*rho2/n_rho
-        # non-inclusive on both sides
-        xxkernel, yykernel = self._gridkernel()
-
-        kernel = torch.zeros((3 * self._params.Nx, 3 * self._params.Ny))
-
         dalpha = 2 * np.pi / n_alpha
-        drho = self._params.rho2 / n_rho
+        alphas = (
+            torch.arange(n_alpha, dtype=DTYPE, device=self._device) + 0.5
+        ) * dalpha
+        # Offset by dalpha/2: the grid stays symmetric under
+        # alpha -> alpha + pi for even n_alpha (needed for the invert_scan identity)
 
-        alpha_iter: Iterable[torch.Tensor] = torch.linspace(
-            0.0, 2 * np.pi - dalpha, n_alpha
+        h, r1, r2, phi = (
+            t.to(dtype=DTYPE, device=self._device) for t in (height, rho1, rho2, phi)
         )
-        if self._verbose:
-            print("Precomputing kernel...")
-            alpha_iter = tqdm(alpha_iter, desc="Kernel (alpha)")
-        rho_iter = torch.linspace(0.5 * drho, self._params.rho2 - 0.5 * drho, n_rho)
-        for alpha in alpha_iter:
-            for rho in rho_iter:
-                w = self._windowfunc(rho)
-                if w == 0.0:
-                    continue
+        if float(h.detach()) <= float(r2.detach()) * abs(np.sin(float(phi.detach()))):
+            raise ValueError(
+                "SQUID loop intersects the sample: height <= rho2*|sin(phi)|."
+            )
 
-                # Calculate the contribution of this (alpha, rho) to the kernel
-                contribution = self._kernel2_contribution(
-                    xxkernel, yykernel, float(alpha), rho
-                )
+        if r1 >= r2:
+            raise ValueError("SQUID inner radius must be smaller than outer radius.")
 
-                # Add the contribution to the kernel, weighted by the window function
-                kernel += rho * w * contribution * dalpha * drho
+        cp = torch.cos(phi)
+        sp = torch.sin(phi)
 
-        kernel = kernel * self._params.kernel2_sign
+        # Gauss-Legendre in rho, split at rho1 (see kernelmath_2d.md):
+        # Inner [0, rho1] with W = 1, outer [rho1, rho2] with W = (1 - x)/2.
+        x, wgl = self._gl_x, self._gl_w  # (n_rho,)
+        rho_in = 0.5 * r1 * (1 + x)  # (n_rho,)
+        rho_out = r1 + 0.5 * (r2 - r1) * (1 + x)  # (n_rho,)
+        q_in = (0.5 * r1) ** 2 * wgl * (1 + x)  # (n_rho,)
+        q_out = (
+            0.25 * (r2 - r1) * wgl * (0.5 * (r2 - r1) * (x - 1) + r2) * (1 - x)
+        )  # (n_rho,)
+        rho = torch.cat([rho_in, rho_out])[:, None, None]  # (2*n_rho, 1, 1)
+        q = torch.cat([q_in, q_out])  # (2*n_rho,), quadrature
 
-        return kernel.to(self._device), torch.fft.fft2(kernel).to(self._device)
+        # Integrand "a" and "b" from the docs live on the (rho, u, v) grid
+        u = self._xxkernel[:, 0].to(DTYPE)[None, :, None]  # (1, M, 1)
+        v = self._yykernel[0, :].to(DTYPE)[None, None, :]  # (1, 1, N)
+
+        kernel_1 = torch.zeros_like(self._xxkernel, dtype=DTYPE, device=self._device)
+        kernel_2 = torch.zeros_like(self._xxkernel, dtype=DTYPE, device=self._device)
+        for alpha in alphas:
+            ca, sa = torch.cos(alpha), torch.sin(alpha)
+            px = u + rho * ca  # p_x
+            py = v - rho * sa * cp  # p_y
+            pz = h + rho * sa * sp  # p_z
+            p3 = (px**2 + py**2 + pz**2) ** 1.5  # |p|^3
+            a = (cp * py - sp * pz) / p3  # (2*n_rho, M, N)
+            b = -cp * px / p3  # (2*n_rho, M, N)
+
+            kernel_1 = kernel_1 + torch.einsum("r,rmn->mn", q, a) * dalpha  # (M, N)
+            kernel_2 = kernel_2 + torch.einsum("r,rmn->mn", q, b) * dalpha  # (M, N)
+
+        kernel_1 *= kernel1_sign
+        kernel_1 = kernel_1.to(self._device, dtype=DTYPE)
+        kernel_2 *= kernel2_sign
+        kernel_2 = kernel_2.to(self._device, dtype=DTYPE)
+
+        return (
+            kernel_1,
+            torch.fft.fft2(kernel_1).to(self._device),
+            kernel_2,
+            torch.fft.fft2(kernel_2).to(self._device),
+        )
 
     def _precompute_window(self) -> torch.Tensor:
         def window1d(N: int) -> torch.Tensor:
             halfN = N // 2
-            w = torch.zeros(3 * N, device=self._device)
+            w = torch.zeros(3 * N, dtype=DTYPE, device=self._device)
             ramp = torch.cos(
-                np.pi / 2 * torch.linspace(-1, 0, halfN, device=self._device)
+                np.pi
+                / 2
+                * torch.linspace(-1, 0, halfN, dtype=DTYPE, device=self._device)
             )
             w[N - halfN : N] = ramp
             w[2 * N : 2 * N + halfN] = torch.flip(ramp, dims=[0])
@@ -1036,34 +1069,20 @@ class Forward2DCurrent:
     def _extend_current(self, current: torch.Tensor) -> torch.Tensor:
         return current[self._xmap[:, None], self._ymap[None, :]] * self._window
 
-    def _windowfunc(self, rho: float) -> float:
-        """Return the window that tapers the repeated, mirrored current distribution.
-
-        The window function:
-        w(rho) = 1 for rho < rho1
-                 1 - (rho-rho1)/(rho2-rho1) for rho1 <= rho < rho2
-                   0 for rho >= rho2
-        """
-        if rho < self._params.rho1:
-            return 1.0
-        elif rho < self._params.rho2:
-            return 1.0 - (rho - self._params.rho1) / (
-                self._params.rho2 - self._params.rho1
-            )
-        else:
-            return 0.0
-
     def forward_t(
-        self, current_x: torch.Tensor, current_y: torch.Tensor
+        self,
+        current_x: torch.Tensor,
+        current_y: torch.Tensor,
+        sensorparameters: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Calculate the 2D SQUID signal from a 2D current distribution on the device.
+        """Calculate the 2D SQUID signal from a 2D current distribution on a device.
 
         Uses the pre-computed kernels and Fourier methods to calculate the 2D SQUID
-        signal from the 2D current distribution on the device. Accelerated fully using
-        Torch, which also ensures compatibility with GPU acceleration and
+        signal from the 2D current distribution on the device. Accelerated fully
+        using Torch, which also ensures compatibility with GPU acceleration and
         autodifferentiation. For single-shot use, without autodifferentiation, it is
-        easier to interface with the forward() model, which is a NumPy wrapper around
-        this function.
+        easier to interface with the forward() model, which is a NumPy wrapper
+        around this function.
 
         Parameters
         ----------
@@ -1073,6 +1092,11 @@ class Forward2DCurrent:
         current_y: torch.Tensor
             A tensor of shape (Nx, Ny) representing the y component of the current
             distribution j(x,y)
+        sensorparameters: torch.Tensor | None
+            An optional tensor. If None, use precomputed kernels. If provided, it
+            should be a tensor of shape (4,) containing the parameters (height,
+            rho1, rho2, phi_eff) to compute new kernels on the fly. This allows for
+            dynamic adjustment of sensor parameters during inference.
 
         Returns
         -------
@@ -1091,14 +1115,26 @@ class Forward2DCurrent:
         # Step 2: Convolve with kernels using FFT
         current_x_fft = torch.fft.fft2(current_x_extended)
         current_y_fft = torch.fft.fft2(current_y_extended)
-        kernel1_fft = self._kernel1_fft  # Precomputed FFT of the kernel
-        kernel2_fft = self._kernel2_fft  # Precomputed FFT of the kernel
+        if sensorparameters is not None:
+            height, rho1, rho2, phi_eff = sensorparameters
+            _, kernel1_fft, _, kernel2_fft = self._compute_kernels(
+                height,
+                rho1,
+                rho2,
+                phi_eff,
+                self._params.kernel1_sign,
+                self._params.kernel2_sign,
+            )
+        else:
+            kernel1_fft = self._kernel1_fft  # Precomputed FFT of the kernel
+            kernel2_fft = self._kernel2_fft  # Precomputed FFT of the kernel
         signal_proj_fft = current_x_fft * kernel1_fft + current_y_fft * kernel2_fft
         signal_proj = torch.fft.ifft2(signal_proj_fft).real * dx * dy
 
         # Step 4: keep only the center part (which is artifact free)
         signal: torch.Tensor = signal_proj[
-            self._params.Nx : 2 * self._params.Nx, self._params.Ny : 2 * self._params.Ny
+            self._params.Nx : 2 * self._params.Nx,
+            self._params.Ny : 2 * self._params.Ny,
         ]
 
         # Put into proper units
