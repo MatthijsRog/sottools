@@ -29,6 +29,7 @@ import scipy.sparse
 import torch
 
 from sottools.forward import Forward1D, Forward2DCurrent, MeshToGrid
+from sottools.mesh import SingleBodyMesh, SimplyConnectedCurrentMesh
 
 type _Fig = matplotlib.figure.Figure
 type _Ax = matplotlib.axes.Axes
@@ -2143,6 +2144,62 @@ class Inverter2D:
         """Set the weight of vorticity regularization."""
         self._lam3 = value
 
+@dataclasses.dataclass
+class FitState2D:
+    """State of the 2D fitting process at one particular point.
+
+    Can be used to communicate intermediate results to a user through a
+    callback function. Before sottools v1.0.0, must use this one also for
+    Inverter2D.
+
+    Parameters
+    ----------
+    step : int
+        Current step number in the fitting process.
+    total_steps : int
+        Total number of steps in the fitting process.
+    loss : float
+        Current value of the loss function.
+    fidelity : float
+        Current value of the fidelity term in the loss function.
+    regularization : float
+        Current value of the regularization term in the loss function.
+    regularization_terms : dict[str, float]
+        Dictionary of the individual regularization terms and their values.
+    mesh: SingleBodyMesh
+        Mesh object representing the mesh used for the inversion.
+    currentforward: Forward2DCurrent
+        The forward model that computes the SOT signal from a gridded current
+        distribution.
+    meshtogrid: MeshToGrid
+        The mesh to grid converter that converts variables on the mesh to gridded
+        kernels that can go into currentforward.
+    streamfunction : np.ndarray
+        Current array defined on the nodes of mesh representing the current density on
+        the device.
+    predicted_signal : np.ndarray
+        Predicted signal array of size (Nx, Ny) representing the predicted
+        signal based on the current density.
+    to_fit_signal : np.ndarray
+        Signal array of size (Nx, Ny) representing the signal to fit.
+    sensor_parameters : np.ndarray, optional
+        Sensor parameters used in the forward model, if applicable. Useful only
+        when performing coinversion. Default is None.
+    """
+
+    step: int
+    total_steps: int
+    loss: float
+    fidelity: float
+    regularization: float
+    regularization_terms: dict[str, float]
+    mesh: SingleBodyMesh
+    currentforward: Forward2DCurrent
+    meshtogrid: MeshToGrid
+    streamfunction: np.ndarray | None
+    predicted_signal: np.ndarray | None
+    to_fit_signal: np.ndarray | None
+    sensor_parameters: np.ndarray | None = None
 
 class Coinversion2D:
     """Inverter for co-fitting the sensor parameters height and phi_eff.
@@ -2230,7 +2287,7 @@ class Coinversion2D:
     training+test seperation is used to prevent overfitting. See documentation for
     further information.
 
-    Callback behaviour: in on_step, FitState1D.current is the current of fold 0
+    Callback behaviour: in on_step, FitState2D.streamfunction is the current of fold 0
     (fitted on the training set of fold 0 only), and predicted_signal is its
     prediction on the full scan, so held-out points are included. on_step is not
     called on the step at which convergence is detected. on_finish receives the
@@ -2422,21 +2479,25 @@ class Coinversion2D:
     def _build_folds(self) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """Build the (training, test) boolean masks for every cross-validation fold.
 
-        Fold i leaves out every K-th scan point starting at index i; those points form
-        the test set, the rest the training set. Each scan point is in exactly one
-        test set. K=1 is the full fit: training and test are both the entire scan.
-        """
-        # TODO: make 2D instead of 1D folds for the gridded signals.
+        Currently, the k=2 folds are in a checkerboard pattern. With t = training and T
+        test, a single fold therefore looks like this:
 
-        n_points = self._data.shape[0]
+        tTtTtTtT...
+        TtTtTtTt...
+        tTtTtTtT...
+        ........
+        ........
+        """
+        N, M = self._data.shape
         k = self._crossvalidation_size
         folds = []
         for i in range(k):
-            training = torch.ones(n_points, dtype=torch.bool, device=self._device)
+            training = torch.ones((N,M), dtype=torch.bool, device=self._device)
             if k == 1:
                 test = training.clone()
             else:
-                training[i::k] = False
+                for j in range(N):
+                    training[j][(j+i)%k::k] = False
                 test = ~training
             folds.append((training, test))
         return tuple(folds)
@@ -2493,10 +2554,9 @@ class Coinversion2D:
             data = self._data[mask]
         else:
             data = self._data
-        residual_norm: torch.Tensor = torch.linalg.norm(
-            signal - data
-        )  # TODO: change to mse_loss for consistency.
-        return residual_norm.pow(2)
+        return torch.nn.functional.mse_loss(
+            signal, data.to(dtype=signal.dtype)
+        )
 
     def _tikhonov_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
         """Tikhonov regularization on the streamfunction.
@@ -2608,22 +2668,23 @@ class Coinversion2D:
         obj = train_fidelity + reg
         return fidelity, regterms, reg, obj
 
-    def _make_fit_state(self, total_steps: int) -> FitState1D:
+    def _make_fit_state(self, total_steps: int) -> FitState2D:
         fidelity, regterms, reg, obj = self._all_loss_terms(
             self._solutions, self._sensor_parameters_free
         )
-        return FitState1D(
+        return FitState2D(
             step=self._parameter_optimizer_step,
             total_steps=total_steps,
             loss=obj,
             fidelity=fidelity,
             regularization=reg,
             regularization_terms=regterms,
-            current=None,  # TODO: change this to some sort of best-fit streamfunction
+            mesh = self._mesh,
+            currentforward = self._currentforward,
+            meshtogrid = self._meshtogrid,
+            streamfunction=self._solution_to_streamvector(self._fitted_solution.detach()).cpu().numpy(),
             predicted_signal=self.prediction,
             to_fit_signal=self.data,
-            xaxis_current=self.ydevice,  # TODO: find alternatives for these x axes
-            xaxis_signal=self.yscan,
             sensor_parameters=self.sensor_parameters,
         )
 
@@ -2715,18 +2776,19 @@ class Coinversion2D:
                     prediction_fold0 = self._signal(
                         sv0, sp, use_cached_kernels=self._cache_kernels
                     )
-                state = FitState1D(
+                state = FitState2D(
                     step=self._parameter_optimizer_step,
                     total_steps=n_steps_start + n_steps_sensor,
                     loss=obj,
                     fidelity=fidelity,
                     regularization=reg,
                     regularization_terms=regterms,
-                    current=None,  # TODO: change this to some sort of best-fit streamfunction
+                    mesh=self._mesh,
+                    streamfunction=self._solution_to_streamvector(self._solutions[0].detach()).cpu().numpy(),
+                    currentforward=self._currentforward,
+                    meshtogrid=self._meshtogrid,
                     predicted_signal=prediction_fold0.cpu().numpy(),
                     to_fit_signal=self.data,
-                    xaxis_current=self.ydevice,  # TODO: find alternatives for these x axes
-                    xaxis_signal=self.yscan,
                     sensor_parameters=sp.cpu().numpy(),
                 )
             history_times.append(time.perf_counter() - start_time)
@@ -2769,9 +2831,9 @@ class Coinversion2D:
             .detach()
             .requires_grad_(True)
         )
-        full_data_mask = torch.ones(
-            self._data.shape[0], dtype=torch.bool, device=self._device
-        ) # TODO: rewrite for 2D
+        full_data_mask = torch.ones_like(
+            self._data, dtype=torch.bool, device=self._device
+        )
         self._optimize_single_solution_fixed_sensor(
             solution,
             self._sensor_parameters_free,
@@ -2856,7 +2918,7 @@ class Coinversion2D:
             )
             Lsv = torch.autograd.grad(
                 F_train
-                + regularizer(  # TODO: fix this regularizer reference...
+                + self._total_regularization(
                     self._solution_to_streamvector(sol)
                 ),
                 sol,
@@ -2921,7 +2983,7 @@ class Coinversion2D:
                     training_set_mask,
                     use_cached_kernels=self._cache_kernels,
                 )
-                + regularizer(  # TODO: fix this regularizer reference...
+                + self._total_regularization(
                     self._solution_to_streamvector(s)
                 )
             ),
@@ -3071,14 +3133,7 @@ class Coinversion2D:
                 dtype=DTYPE, device=self._device
             )
 
-        # TODO: fill self._solutions with initial values solution0
-        self._solutions = [
-            torch.zeros(
-                self._currentforward.params.Ndevice,  # TODO: connect this to the mesh to get the real number of free nodes
-                requires_grad=True,
-                device=self._device,
-                dtype=DTYPE,
-            )
+        self._solutions = [solution0.clone().detach().requires_grad_(True)
             for _ in range(self._crossvalidation_size)
         ]  # List of solutions, one predicted
         # by each training set. The final prediction should be made by using the final
@@ -3167,7 +3222,9 @@ class Coinversion2D:
             self._solution_to_streamvector(self._fitted_solution).detach().cpu().numpy()
         )
 
-    # TODO: Coinversion1D had ydevice, yscan as nice getters to access mesh. Should add here too for plotting of solutions maybe. Or not, it was not used that much.
+    @property
+    def mesh(self) -> SingleBodyMesh:
+        return self._mesh
 
     @property
     def data(self) -> np.ndarray:
