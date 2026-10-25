@@ -32,4 +32,4 @@ examples/
 *.txt
 docs/_build/
 docs/tutorials/illustrations/
-docs/tutorials/thesis_fig_data/
+docs/tutorials/thesis_fig_data/.coverage
