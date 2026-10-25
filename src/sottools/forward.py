@@ -1253,6 +1253,7 @@ class MeshToGrid:
                 torch.from_numpy(Mx_coo.data).to(DTYPE),
                 size=Mx_coo.shape,
                 device=self._device,
+                check_invariants=False,
             )
             .coalesce()
             .to(self._device)
@@ -1263,6 +1264,7 @@ class MeshToGrid:
                 torch.from_numpy(My_coo.data).to(DTYPE),
                 size=My_coo.shape,
                 device=self._device,
+                check_invariants=False,
             )
             .coalesce()
             .to(self._device)

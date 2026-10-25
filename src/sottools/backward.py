@@ -25,11 +25,12 @@ from typing import Any, Protocol
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.optimize
 import scipy.sparse
 import torch
 
 from sottools.forward import Forward1D, Forward2DCurrent, MeshToGrid
-from sottools.mesh import SingleBodyMesh, SimplyConnectedCurrentMesh
+from sottools.mesh import SingleBodyMesh
 
 type _Fig = matplotlib.figure.Figure
 type _Ax = matplotlib.axes.Axes
@@ -96,10 +97,10 @@ class FitCallback(Protocol):
     This protocol generalizes to both 1D and 2D inverters.
     """
 
-    def on_step(self, state: FitState1D) -> None:
+    def on_step(self, state: FitState1D | FitState2D) -> None:
         """Call at each (callback) step of the fit."""
 
-    def on_finish(self, state: FitState1D) -> None:
+    def on_finish(self, state: FitState1D | FitState2D) -> None:
         """Call at the end of the fit."""
 
 
@@ -1933,7 +1934,7 @@ class Inverter2D:
         indices = torch.from_numpy(np.vstack([coo.row, coo.col]).astype(np.int64))
         values = torch.from_numpy(coo.data).to(dtype=DTYPE)
         return torch.sparse_coo_tensor(
-            indices, values, size=coo.shape, device=self._device
+            indices, values, size=coo.shape, device=self._device, check_invariants=False
         ).coalesce()
 
     def _solution_to_streamvector(self) -> torch.Tensor:
@@ -2144,6 +2145,7 @@ class Inverter2D:
         """Set the weight of vorticity regularization."""
         self._lam3 = value
 
+
 @dataclasses.dataclass
 class FitState2D:
     """State of the 2D fitting process at one particular point.
@@ -2201,6 +2203,7 @@ class FitState2D:
     to_fit_signal: np.ndarray | None
     sensor_parameters: np.ndarray | None = None
 
+
 class Coinversion2D:
     """Inverter for co-fitting the sensor parameters height and phi_eff.
 
@@ -2247,28 +2250,30 @@ class Coinversion2D:
         The number of cross-validation splits. Default is 1. If larger than 1,
         cross-validation is used to prevent overfitting.
     convergence_checker : CoinversionConvergenceChecker | None, optional
-        The convergence checker to use. Default is None.
+        Optional additional stopping criterion, checked once per L-BFGS-B iteration
+        on the fit history (which holds one entry per evaluation, line-search trials
+        included). L-BFGS-B's own criteria (LBFGSB_FTOL, LBFGSB_GTOL) always apply.
+        Default is None.
     callback : FitCallback | None, optional
         The callback to use during fitting. Default is None.
     callback_every : int, optional
-        Call callback.on_step every callback_every sensor optimization steps.
-        Default is 1.
+        Call callback.on_step every callback_every L-BFGS-B iterations of the sensor
+        optimization. Default is 1.
     device : torch.device | None, optional
         The device to use for computations. Default is None.
-    lr_sensor : float | LearningRateScheduler, optional
-        The learning rate for sensor parameters. Default is 1e-2. Learning rate
-        schedulers are deep-copied and therefore disjoint from any externally kept
-        reference.
-    lr_current : float | LearningRateScheduler, optional
-        The learning rate for current parameters. Default is 1.0. Learning rate
-        schedulers are deep-copied and therefore disjoint from any externally kept
-        reference.
+        lr_current : float, optional
+        The learning rate of the inner L-BFGS current optimization. Default is 1.0.
     cache_kernels : bool, optional
         Whether to cache kernels. Default is True.
     lumped_mass: bool, optional
         Whether to use a lumped mass matrix for the Tikhonov regularization.
         Default is False, however, on fine meshes, the lumped mass matrix is
         many times faster, and lumped_mass=False can stall the inversion.
+    use_cg: bool, optional
+        Whether to compute the implicit-differentiation vector "v" with the conjugate
+        gradient method (CG_RTOL, CG_MAXITER). If False, the full Hessian is built
+        explicitly, costing one Hessian-vector product per unknown and O(N^2) memory;
+        only practical for small meshes and for testing. Default is True.
     initial_streamfunction: np.ndarray, optional
         Initial guess for the streamfunction, of shape (Nmesh_vertices,). If not
         supplied, the initial guess is zero everywhere.
@@ -2287,11 +2292,17 @@ class Coinversion2D:
     training+test seperation is used to prevent overfitting. See documentation for
     further information.
 
-    Callback behaviour: in on_step, FitState2D.streamfunction is the current of fold 0
-    (fitted on the training set of fold 0 only), and predicted_signal is its
-    prediction on the full scan, so held-out points are included. on_step is not
-    called on the step at which convergence is detected. on_finish receives the
-    final current, fitted on the full dataset, and its prediction.
+    The sensor parameters are optimized with L-BFGS-B (scipy.optimize). Each
+    evaluation converges the current of every fold at the trial sensor parameters,
+    computes the cross-validation score and its hypergradient by implicit
+    differentiation.
+
+    Callback behaviour: on_step is called once per L-BFGS-B iteration (every
+    callback_every iterations) with the state of the most recent evaluation.
+    FitState2D.streamfunction is the current of fold 0 (fitted on the training set of
+    fold 0 only), and predicted_signal is its prediction on the full scan, so held-out
+    points are included. on_finish receives the final current, fitted on the full
+    dataset, and its prediction.
 
     All angles, including the fitted sensor_parameters[3] and history.phi_history,
     are phi_eff in radians (see initial_phi_eff).
@@ -2300,6 +2311,18 @@ class Coinversion2D:
     LBFGS_MAXREPEATS = 10
     LBFGS_TOLERANCE_GRAD = 1e-6
     LBFGS_TOLERANCE_ABS = 1e-10
+    LBFGSB_FTOL = 1e-8
+    LBFGSB_GTOL = 1e-6
+    CG_MAXITER = 10000
+    CG_RTOL = 1e-2
+
+    # Type hints
+    _parameter_optimizer_step: int
+    _solutions: list[torch.Tensor]
+    _v_previous: list[np.ndarray]
+    _fitted_solution: torch.Tensor | None
+    _sensor_parameters_free: torch.Tensor
+    _history: CoinversionFitHistory
 
     def __init__(
         self,
@@ -2317,10 +2340,10 @@ class Coinversion2D:
         callback: FitCallback | None = None,
         callback_every: int = 1,
         device: torch.device | None = None,
-        lr_sensor: float | LearningRateScheduler = 1e-2,
-        lr_current: float | LearningRateScheduler = 1.0,
+        lr_current: float = 1.0,
         cache_kernels: bool = True,
         lumped_mass: bool = False,
+        use_cg: bool = True,
         initial_streamfunction: np.ndarray | None = None,
         verbose: bool = False,
     ):
@@ -2344,9 +2367,9 @@ class Coinversion2D:
         self._callback = callback
         self._callback_every = callback_every
         self._device = device
-        self._fitted_current: np.ndarray | None = None
         self._cache_kernels = cache_kernels
         self._lumped_mass = lumped_mass
+        self._use_cg = use_cg
         self._initial_streamfunction = initial_streamfunction
         self._verbose = verbose
 
@@ -2354,8 +2377,6 @@ class Coinversion2D:
 
         self._lr_current = lr_current
         self._lr_current_initial = lr_current
-        self._lr_sensor = lr_sensor
-        self._lr_sensor_initial = lr_sensor
         self._initial_phi_eff = initial_phi_eff
         initial_relative_height = (
             initial_height
@@ -2473,7 +2494,7 @@ class Coinversion2D:
         indices = torch.from_numpy(np.vstack([coo.row, coo.col]).astype(np.int64))
         values = torch.from_numpy(coo.data).to(dtype=DTYPE)
         return torch.sparse_coo_tensor(
-            indices, values, size=coo.shape, device=self._device
+            indices, values, size=coo.shape, device=self._device, check_invariants=False
         ).coalesce()
 
     def _build_folds(self) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
@@ -2492,12 +2513,12 @@ class Coinversion2D:
         k = self._crossvalidation_size
         folds = []
         for i in range(k):
-            training = torch.ones((N,M), dtype=torch.bool, device=self._device)
+            training = torch.ones((N, M), dtype=torch.bool, device=self._device)
             if k == 1:
                 test = training.clone()
             else:
                 for j in range(N):
-                    training[j][(j+i)%k::k] = False
+                    training[j][(j + i) % k :: k] = False
                 test = ~training
             folds.append((training, test))
         return tuple(folds)
@@ -2554,9 +2575,7 @@ class Coinversion2D:
             data = self._data[mask]
         else:
             data = self._data
-        return torch.nn.functional.mse_loss(
-            signal, data.to(dtype=signal.dtype)
-        )
+        return torch.nn.functional.mse_loss(signal, data.to(dtype=signal.dtype))
 
     def _tikhonov_regularization(self, streamvector: torch.Tensor) -> torch.Tensor:
         """Tikhonov regularization on the streamfunction.
@@ -2672,6 +2691,11 @@ class Coinversion2D:
         fidelity, regterms, reg, obj = self._all_loss_terms(
             self._solutions, self._sensor_parameters_free
         )
+        if self._fitted_solution is None:
+            raise RuntimeError(
+                "Fitted solution is None. This indicates a problem in the module. "
+                "Raise an issue on GitHub."
+            )
         return FitState2D(
             step=self._parameter_optimizer_step,
             total_steps=total_steps,
@@ -2679,10 +2703,14 @@ class Coinversion2D:
             fidelity=fidelity,
             regularization=reg,
             regularization_terms=regterms,
-            mesh = self._mesh,
-            currentforward = self._currentforward,
-            meshtogrid = self._meshtogrid,
-            streamfunction=self._solution_to_streamvector(self._fitted_solution.detach()).cpu().numpy(),
+            mesh=self._mesh,
+            currentforward=self._currentforward,
+            meshtogrid=self._meshtogrid,
+            streamfunction=self._solution_to_streamvector(
+                self._fitted_solution.detach()
+            )
+            .cpu()
+            .numpy(),
             predicted_signal=self.prediction,
             to_fit_signal=self.data,
             sensor_parameters=self.sensor_parameters,
@@ -2696,78 +2724,78 @@ class Coinversion2D:
         """Perform or continue a full co-inversion of the dataset.
 
         If the fit has not been started, fits until convergence is reached, or until
-        n_steps_sensor sensor optimization steps have been performed. If the fit has
-        already been started (and reset() has not been called), continues where was
-        left off.
+        n_steps_sensor evaluations of the cross-validation score have been performed.
+        Calling fit again continues from the current sensor parameters, fold currents
+        and CG warm starts; the L-BFGS-B curvature memory is restarted.
 
         Parameters
         ----------
         n_steps_sensor : int, optional
-            The number of sensor optimization steps to perform. Default is 500.
+            Maximum number of evaluations of the cross-validation score and its
+            gradient (line-search evaluations included). Default is 500.
         n_steps_current : int, optional
-            The number of current optimization steps to perform for each sensor
-            optimization step. Default is 200.
+            Maximum number of inner L-BFGS iterations per current fit. Default is 200.
 
         Returns
         -------
         dict[str, Any]
             A short fit report, containing the following keys:
-            - "message" (str): A message indicating the reason for stopping the fit.
-            - "steps" (int): The number of sensor optimization steps performed.
-            - "steps_total" (int): The total number of sensor optimization steps
-              performed since the last reset.
-            - "final_sensor_parameters" (np.ndarray): The final sensor parameters after
-              the fit, of shape (4,).
+            - "message" (str): "converged" or "max_steps_reached".
+            - "optimizer_message" (str): The termination message of L-BFGS-B.
+            - "steps" (int): The number of evaluations performed in this call.
+            - "steps_total" (int): The total number of evaluations since the last
+              reset.
         """
-        optimize_current_times = []
-        calculate_v_times = []
-        optimize_sensor_times = []
-        history_times = []
+        optimize_current_times: list[float] = []
+        calculate_v_times: list[float] = []
+        history_times: list[float] = []
 
         n_steps_start = self._parameter_optimizer_step
 
         did_converge = False
 
-        while self._parameter_optimizer_step - n_steps_start < n_steps_sensor:
-            # Update learning rate for the sensor based on the scheduler.
-            lr_sensor = self._get_lr_sensor(self._parameter_optimizer_step)
-            lr_current = self._get_lr_current(self._parameter_optimizer_step)
+        if self._verbose:
+            print(
+                f"Starting co-inversion with {n_steps_sensor} sensor optimization "
+                f"steps and {n_steps_current} current optimization steps per sensor "
+                f"step."
+            )
+        # ----------------------------------
+        # START OF THE MAIN COINVERSION LOOP
+        # ----------------------------------
+        lr_current = self._lr_current
 
-            self._parameter_optimizer.param_groups[0]["lr"] = lr_sensor
+        norm_constant = torch.mean(
+            self._data**2
+        ).detach()  # For normalizing the loss history
 
-            # Step 1: for each training set, optimize the current with sensor parameters
-            # fixed.
-            start_time = time.perf_counter()
-            if self._cache_kernels:
-                self._cache_kernels_into_forward(
-                    self._sensor_parameters_free, self._currentforward
-                )
-            self._optimize_solutions_fixed_sensor(
+        latest_state: FitState2D | None = None
+        n_iterations = 0
+
+        def cv_score_and_gradient(
+            sensor_parameters_free_np: np.ndarray,
+        ) -> tuple[float, np.ndarray]:
+            nonlocal latest_state
+            theta = torch.from_numpy(sensor_parameters_free_np).to(
+                self._device, dtype=DTYPE
+            )
+            self._optimize_current_step(
+                theta,
+                self._currentforward,
                 self._solutions,
-                self._sensor_parameters_free,
-                n_steps_current,
                 lr_current,
+                n_steps_current,
+                optimize_current_times,
+                self._parameter_optimizer_step,
             )
-            optimize_current_times.append(time.perf_counter() - start_time)
-            start_time = time.perf_counter()
-            vs = self._calculate_vs_at_fixed_point(
-                self._solutions, self._sensor_parameters_free
-            )
-            calculate_v_times.append(time.perf_counter() - start_time)
+            vs = self._calculate_vs_step(theta, self._solutions, calculate_v_times)
 
             # Now we record the history:
-            start_time = time.perf_counter()
-            fidelity, regterms, reg, obj = self._all_loss_terms(
-                self._solutions, self._sensor_parameters_free
+            fidelity, obj, reg, regterms, sp = self._record_history_step(
+                theta, self._solutions, history_times
             )
-            sp = self._full_sensor_parameters(self._sensor_parameters_free.detach())
-            height, phi_eff = sp[0].item(), sp[3].item()
-            self._history.append(fidelity, regterms, reg, obj, height, phi_eff)
 
-            do_callback = self._callback is not None and (
-                (self._parameter_optimizer_step + 1) % self._callback_every == 0
-            )
-            if do_callback:
+            if self._callback is not None:
                 # Sensor parameters are not yet updated in this step, so the cached
                 # kernel (if any) still matches sp: one cheap FFT convolution.
                 with torch.no_grad():
@@ -2776,7 +2804,7 @@ class Coinversion2D:
                     prediction_fold0 = self._signal(
                         sv0, sp, use_cached_kernels=self._cache_kernels
                     )
-                state = FitState2D(
+                latest_state = FitState2D(
                     step=self._parameter_optimizer_step,
                     total_steps=n_steps_start + n_steps_sensor,
                     loss=obj,
@@ -2784,27 +2812,50 @@ class Coinversion2D:
                     regularization=reg,
                     regularization_terms=regterms,
                     mesh=self._mesh,
-                    streamfunction=self._solution_to_streamvector(self._solutions[0].detach()).cpu().numpy(),
+                    streamfunction=self._solution_to_streamvector(
+                        self._solutions[0].detach()
+                    )
+                    .cpu()
+                    .numpy(),
                     currentforward=self._currentforward,
                     meshtogrid=self._meshtogrid,
                     predicted_signal=prediction_fold0.cpu().numpy(),
                     to_fit_signal=self.data,
                     sensor_parameters=sp.cpu().numpy(),
                 )
-            history_times.append(time.perf_counter() - start_time)
 
-            start_time = time.perf_counter()
-            self._optimize_sensor_fixed_streamvector(
-                self._solutions,
-                self._sensor_parameters_free,
-                self._parameter_optimizer,
-                vs,
-            )
-            optimize_sensor_times.append(time.perf_counter() - start_time)
+            theta_leaf = theta.clone().requires_grad_(True)
+            self._hypergradient_optimize_sensor(self._solutions, theta_leaf, vs)
+            theta_leaf_grad = theta_leaf.grad
+            assert theta_leaf_grad is not None, "Gradient computation failed."
+            gradient = theta_leaf_grad.detach().cpu().numpy().astype(np.float64)
 
             self._parameter_optimizer_step += 1
 
-            # Check for convergence if a checker is provided
+            cv_score = fidelity / norm_constant.item()  # summed test-set fidelity
+            grad_norm = gradient / norm_constant.item()
+
+            return cv_score, grad_norm
+
+        def callback(intermediate_result: scipy.optimize.OptimizeResult) -> None:
+            nonlocal did_converge, n_iterations
+            n_iterations += 1
+            if self._callback is not None and n_iterations % self._callback_every == 0:
+                if latest_state is not None:
+                    self._callback.on_step(latest_state)
+                else:
+                    warnings.warn(
+                        "No fit state available, skipping on_step.", stacklevel=2
+                    )
+            if self._verbose:
+                theta_now = torch.from_numpy(intermediate_result.x).to(
+                    self._device, dtype=DTYPE
+                )
+                sp_now = self._full_sensor_parameters(theta_now)
+                print(
+                    f"Iteration {n_iterations}: h = {sp_now[0].item():.4f}, "
+                    f"phi_eff = {np.rad2deg(sp_now[3].item()):.3f} deg"
+                )
             if self._convergence_checker is not None:
                 if self._convergence_checker.check(self._history):
                     if self._verbose:
@@ -2813,12 +2864,35 @@ class Coinversion2D:
                             f"{self._parameter_optimizer_step}."
                         )
                     did_converge = True
-                    break
+                    raise StopIteration
 
-            # Perform live callback
-            if do_callback:
-                assert self._callback is not None
-                self._callback.on_step(state)
+        start_time = time.perf_counter()
+        if self._verbose:
+            print("Optimizing sensor parameters.")
+        theta_start = self._sensor_parameters_free.detach().cpu().numpy()
+        result = scipy.optimize.minimize(
+            cv_score_and_gradient,
+            theta_start,
+            jac=True,
+            method="L-BFGS-B",
+            bounds=[(None, None), (-np.pi / 2, np.pi / 2)],
+            callback=callback,
+            options={
+                "maxfun": n_steps_sensor,
+                "maxiter": n_steps_sensor,
+                "ftol": self.LBFGSB_FTOL,
+                "gtol": self.LBFGSB_GTOL,
+            },
+        )
+        self._sensor_parameters_free = torch.from_numpy(result.x).to(
+            self._device, dtype=DTYPE
+        )
+
+        optimize_sensor_time = time.perf_counter() - start_time
+
+        # ----------------------------------
+        # END OF THE MAIN COINVERSION LOOP
+        # ----------------------------------
 
         # Now that we are done, we have the proper fixed parameters to calculate the
         # current one last time. Soft start from the average current:
@@ -2838,7 +2912,7 @@ class Coinversion2D:
             solution,
             self._sensor_parameters_free,
             n_steps_current,
-            self._get_lr_current(self._parameter_optimizer_step),
+            self._lr_current,
             full_data_mask,
         )
         self._fitted_solution = solution.detach()
@@ -2866,13 +2940,7 @@ class Coinversion2D:
                 f"Min: {np.min(calculate_v_times):.4f}\t"
                 f"Total: {np.sum(calculate_v_times):.4f} s"
             )
-            print(
-                f"SENSOR DETERMINATION --- \tAverage: {
-                    np.mean(optimize_sensor_times):.4f} s\t"
-                f"Max: {np.max(optimize_sensor_times):.4f} s\t"
-                f"Min: {np.min(optimize_sensor_times):.4f}\t"
-                f"Total: {np.sum(optimize_sensor_times):.4f} s"
-            )
+            print(f"SENSOR DETERMINATION --- \tTotal: {optimize_sensor_time:.4f} s")
             print(
                 f"HISTORY RECORDING --- \t\tAverage: {np.mean(history_times):.4f} s\t"
                 f"Max: {np.max(history_times):.4f} s\t"
@@ -2883,19 +2951,79 @@ class Coinversion2D:
         # At the end, return a small dictionary reporting the final state
         final_sensor_params = self.sensor_parameters
         nsteps = self._parameter_optimizer_step - n_steps_start
-        stopreason = "converged" if did_converge else "max_steps_reached"
+        stopreason = (
+            "converged" if (did_converge or result.success) else "max_steps_reached"
+        )
         return {
             "message": stopreason,
+            "optimizer_message": str(result.message),
             "steps": nsteps,
             "steps_total": self._parameter_optimizer_step,
             "final_sensor_parameters": final_sensor_params,
         }
 
-    def _optimize_sensor_fixed_streamvector(
+    def _record_history_step(
+        self,
+        sensor_parameters_free: torch.Tensor,
+        solutions: list[torch.Tensor],
+        history_times: list[Any],
+    ) -> tuple[float, float, float, dict[str, float | int], torch.Tensor]:
+        start_time = time.perf_counter()
+        fidelity, regterms, reg, obj = self._all_loss_terms(
+            solutions, sensor_parameters_free
+        )
+        sp = self._full_sensor_parameters(sensor_parameters_free.detach())
+        height, phi_eff = sp[0].item(), sp[3].item()
+        self._history.append(fidelity, regterms, reg, obj, height, phi_eff)
+        history_times.append(time.perf_counter() - start_time)
+        return fidelity, obj, reg, regterms, sp
+
+    def _calculate_vs_step(
+        self,
+        sensor_parameters_free: torch.Tensor,
+        solutions: list[torch.Tensor],
+        calculate_v_times: list[Any],
+    ) -> list[torch.Tensor]:
+        start_time = time.perf_counter()
+        if self._verbose:
+            print("\t Starting v calculation.")
+        vs = self._calculate_vs_at_fixed_point(solutions, sensor_parameters_free)
+        calculate_v_times.append(time.perf_counter() - start_time)
+        return vs
+
+    def _optimize_current_step(
+        self,
+        sensor_parameters_free: torch.Tensor,
+        currentforward: Forward2DCurrent,
+        solutions: list[torch.Tensor],
+        lr_current: float | int,
+        n_steps_current: int,
+        optimize_current_times: list[Any],
+        parameter_optimizer_step: int = 0,
+    ) -> None:
+        if self._verbose:
+            print(
+                f"Evaluation {parameter_optimizer_step + 1}: optimizing fold currents."
+            )
+        start_time = time.perf_counter()
+        if self._cache_kernels:
+            if self._verbose:
+                print("\t Caching kernels into forward model.")
+            self._cache_kernels_into_forward(sensor_parameters_free, currentforward)
+        if self._verbose:
+            print("\t Optimizing current for each fold.")
+        self._optimize_solutions_fixed_sensor(
+            solutions,
+            sensor_parameters_free,
+            n_steps_current,
+            lr_current,
+        )
+        optimize_current_times.append(time.perf_counter() - start_time)
+
+    def _hypergradient_optimize_sensor(
         self,
         solutions: list[torch.Tensor],
         sensor_parameters_free: torch.Tensor,
-        parameter_optimizer: torch.optim.Optimizer,
         vs: list[torch.Tensor],
     ) -> None:
         # Without CV, one calculates the surrogate F - Lcurr * v
@@ -2918,18 +3046,14 @@ class Coinversion2D:
             )
             Lsv = torch.autograd.grad(
                 F_train
-                + self._total_regularization(
-                    self._solution_to_streamvector(sol)
-                ),
+                + self._total_regularization(self._solution_to_streamvector(sol)),
                 sol,
                 create_graph=True,
             )[0]
             surrogate = F_test - (Lsv * vs[i]).sum()
             surrogates.append(surrogate)
         composite_surrogate: torch.Tensor = torch.stack(surrogates).sum()
-        parameter_optimizer.zero_grad()
         composite_surrogate.backward(inputs=sensor_parameters_free)  # type: ignore[no-untyped-call]
-        parameter_optimizer.step()
 
     def _calculate_vs_at_fixed_point(
         self, solutions: list[torch.Tensor], sensor_parameters_free: torch.Tensor
@@ -2945,6 +3069,7 @@ class Coinversion2D:
                 sensor_parameters_free,
                 training_set_mask,
                 test_set_mask,
+                i,
             )
             vs.append(v)
         return vs
@@ -2955,8 +3080,8 @@ class Coinversion2D:
         sensor_parameters_free: torch.Tensor,
         training_set_mask: torch.Tensor,
         test_set_mask: torch.Tensor,
+        fold_index: int,
     ) -> torch.Tensor:
-        # TODO: implement CG here because direct Hessian is too large
         # Calculates the "v" object at a fixed point in the optimization scheme.
         # Final v is detached from the graph.
         # Where v is calculated using only the TEST SET
@@ -2974,26 +3099,90 @@ class Coinversion2D:
                 use_cached_kernels=self._cache_kernels,
             ),
             sol,
-        )[0]
-        hessian = torch.autograd.functional.hessian(
-            lambda s: (
+        )[0].double()
+        if self._use_cg:
+            # Iterative CG is used to solve H v = fsol, where H is the Hessian of the
+            # inner objective ("training set"), differentiated twice to the solution
+            # variable, and fsol is the gradient of the outer objective ("test set")
+            # with respect to the solution variable.
+            start_time = time.perf_counter()
+            auxvec = torch.autograd.grad(
                 self._fidelity(
-                    self._solution_to_streamvector(s),
+                    self._solution_to_streamvector(sol),
                     sensor_params_fixed,
                     training_set_mask,
                     use_cached_kernels=self._cache_kernels,
                 )
-                + self._total_regularization(
-                    self._solution_to_streamvector(s)
+                + self._total_regularization(self._solution_to_streamvector(sol)),
+                sol,
+                create_graph=True,
+            )[0]
+
+            def hessian_vector_product(vec: torch.Tensor) -> torch.Tensor:
+                return torch.autograd.grad(auxvec @ vec, sol, retain_graph=True)[0]
+
+            def hvp_np(vec_np: np.ndarray) -> np.ndarray:
+                vec = torch.from_numpy(vec_np).to(DTYPE).to(self._device)
+                hv = hessian_vector_product(vec).double()
+                return hv.detach().cpu().numpy()
+
+            fsol_np = fsol.detach().cpu().numpy()
+            n_cg_iters = 0
+
+            def increase_n_cg_iters(x: np.ndarray) -> None:
+                nonlocal n_cg_iters
+                n_cg_iters += 1
+
+            v_np, info = scipy.sparse.linalg.cg(
+                scipy.sparse.linalg.LinearOperator(
+                    shape=(self._N_solution, self._N_solution),
+                    matvec=hvp_np,
+                    dtype=np.float64,
+                ),
+                fsol_np,
+                rtol=self.CG_RTOL,
+                maxiter=self.CG_MAXITER,
+                callback=increase_n_cg_iters,
+                x0=self._v_previous[fold_index],
+            )
+            relative_residual = np.linalg.norm(fsol_np - hvp_np(v_np)) / np.linalg.norm(
+                fsol_np
+            )
+            if info != 0:
+                warnings.warn(
+                    f"Conjugate gradient did not converge within CG_MAXITER="
+                    f"{self.CG_MAXITER} iterations. Relative residual: "
+                    f"{relative_residual}. Increase CG_MAXITER or CG_RTOL, or "
+                    f"use the exact Hessian calculation instead.",
+                    stacklevel=2,
                 )
-            ),
-            sol,
-            vectorize=True,
-        )  # type: ignore[no-untyped-call]
-        v: torch.Tensor = (
-            torch.linalg.solve(hessian.double(), fsol.double()).to(DTYPE).detach()
-        )
-        return v
+            if self._verbose:
+                print(
+                    f"\t CG finished in {n_cg_iters} iterations with relative "
+                    f"residual {relative_residual:.2e} in "
+                    f"{time.perf_counter() - start_time:.4f} s."
+                )
+            v_cg = torch.from_numpy(v_np).to(DTYPE).to(self._device).detach()
+            self._v_previous[fold_index] = v_np
+            return v_cg
+        else:
+            hessian = torch.autograd.functional.hessian(
+                lambda s: (
+                    self._fidelity(
+                        self._solution_to_streamvector(s),
+                        sensor_params_fixed,
+                        training_set_mask,
+                        use_cached_kernels=self._cache_kernels,
+                    )
+                    + self._total_regularization(self._solution_to_streamvector(s))
+                ),
+                sol,
+                vectorize=False,
+            )  # type: ignore[no-untyped-call]
+            v: torch.Tensor = (
+                torch.linalg.solve(hessian.double(), fsol.double()).to(DTYPE).detach()
+            )
+            return v
 
     def _optimize_solutions_fixed_sensor(
         self,
@@ -3078,22 +3267,6 @@ class Coinversion2D:
                 )
                 break
 
-    def _get_lr_sensor(self, parameter_optimizer_step: int) -> float:
-        lr_sensor = (
-            self._lr_sensor(parameter_optimizer_step)
-            if isinstance(self._lr_sensor, LearningRateScheduler)
-            else self._lr_sensor
-        )
-        return lr_sensor
-
-    def _get_lr_current(self, parameter_optimizer_step: int) -> float:
-        lr_current = (
-            self._lr_current(parameter_optimizer_step)
-            if isinstance(self._lr_current, LearningRateScheduler)
-            else self._lr_current
-        )
-        return lr_current
-
     def reset(self) -> None:
         """Reset the state of the fit to return to the initial state.
 
@@ -3133,12 +3306,18 @@ class Coinversion2D:
                 dtype=DTYPE, device=self._device
             )
 
-        self._solutions = [solution0.clone().detach().requires_grad_(True)
+        self._solutions = [
+            solution0.clone().detach().requires_grad_(True)
             for _ in range(self._crossvalidation_size)
         ]  # List of solutions, one predicted
         # by each training set. The final prediction should be made by using the final
         # kernel and fitting on a training set spanning the entire data set.
         self._fitted_solution = None
+
+        self._v_previous = [
+            np.zeros(self._N_solution, dtype=np.float64)
+            for _ in range(self._crossvalidation_size)
+        ]
 
         # Initialize the free sensor parameters (height and phi_eff) with the provided
         # initial values
@@ -3148,50 +3327,16 @@ class Coinversion2D:
             device=self._device,
             dtype=DTYPE,
         )
-        self._lr_sensor = self._lr_sensor_initial
-        lr_sensor = self._get_lr_sensor(
-            self._parameter_optimizer_step
-        )  # Should be 0 :)
-        self._parameter_optimizer = torch.optim.Adam(
-            [self._sensor_parameters_free], lr=lr_sensor
-        )
 
         self._history = CoinversionFitHistory()
 
     @property
-    def lr_sensor(self) -> float | LearningRateScheduler:
-        """The learning rate for the sensor parameters, potentially a scheduler."""
-        return self._lr_sensor
-
-    @lr_sensor.setter
-    def lr_sensor(self, value: float | LearningRateScheduler) -> None:
-        # Setting the learning rate to a float when a scheduler is provided
-        # should raise. However, changing the scheduler mid-run is allowed.
-        if isinstance(self._lr_sensor, LearningRateScheduler) and (
-            not isinstance(value, LearningRateScheduler)
-        ):
-            raise ValueError(
-                "Cannot set lr_sensor to a float when a "
-                "LearningRateScheduler is in use. Use a scheduler or set "
-                "the initial learning rate to a float."
-            )
-        self._lr_sensor = value
-
-    @property
-    def lr_current(self) -> float | LearningRateScheduler:
-        """The learning rate for the current optimization, potentially a scheduler."""
+    def lr_current(self) -> float:
+        """The learning rate of the inner current optimization."""
         return self._lr_current
 
     @lr_current.setter
-    def lr_current(self, value: float | LearningRateScheduler) -> None:
-        if isinstance(self._lr_current, LearningRateScheduler) and (
-            not isinstance(value, LearningRateScheduler)
-        ):
-            raise ValueError(
-                "Cannot set lr_current to a float when a "
-                "LearningRateScheduler is in use. Use a scheduler or set "
-                "the initial learning rate to a float."
-            )
+    def lr_current(self, value: float) -> None:
         self._lr_current = value
 
     @property
@@ -3214,7 +3359,7 @@ class Coinversion2D:
             return self._fitted_solution.detach().cpu().numpy()
 
     @property
-    def fitted_streamfucntion(self) -> np.ndarray | None:
+    def fitted_streamfunction(self) -> np.ndarray | None:
         """The fitted streamfunction calculated from the full dataset."""
         if self._fitted_solution is None:
             return None
@@ -3224,6 +3369,7 @@ class Coinversion2D:
 
     @property
     def mesh(self) -> SingleBodyMesh:
+        """The mesh used for the inversion."""
         return self._mesh
 
     @property
@@ -3234,7 +3380,7 @@ class Coinversion2D:
     @property
     def prediction(self) -> np.ndarray:
         """The predicted signal corresponding to the last-fit solution."""
-        if self.solution is None:
+        if self._fitted_solution is None:
             raise ValueError("No solution has been fitted yet. Call fit() first.")
         with torch.no_grad():
             sensorparams = self._full_sensor_parameters(self._sensor_parameters_free)

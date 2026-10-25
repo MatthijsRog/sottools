@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sottools"
-version = "0.1.5"
+version = "0.2.0"
 description = "SQUID-on-tip current imaging forward and inverse modeling"
 readme = "README.md"
 license = "MIT"
@@ -107,6 +107,7 @@ warn_return_any = false
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = ["slow: full coinversion runs (minutes)"]
 
 [tool.coverage.run]
 source = ["sottools"]

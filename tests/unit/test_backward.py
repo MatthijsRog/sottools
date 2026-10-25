@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import scipy.optimize
 import torch
 
 import sottools.backward as backward
@@ -625,3 +626,309 @@ def test_coinv_convergence(coinv_problem, make_coinverter):
     assert res["message"] == "converged"
     assert res["steps"] < 300
     assert abs(coinverter.sensor_parameters[0] - params.height) < 0.03
+
+
+# -----------------------------
+# Coinversion2D End-To-End tests
+# -----------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "K, invert_scan, lumped_mass",
+    [
+        (1, False, True),
+        (2, False, True),
+        (1, True, True),
+        (2, True, True),
+        (1, False, False),
+    ],
+)
+def test_coinv2d_recovery(K, invert_scan, lumped_mass, request, make_coinverter2d):
+    problem = request.getfixturevalue(
+        "coinv2d_problem_inverted" if invert_scan else "coinv2d_problem"
+    )
+    coinverter = make_coinverter2d(
+        problem, crossvalidation_size=K, lumped_mass=lumped_mass
+    )
+    res = coinverter.fit(n_steps_sensor=500, n_steps_current=500)
+    h, _, _, phi_eff = res["final_sensor_parameters"]
+
+    assert abs(h - problem.params.height) < 0.01
+    assert abs(phi_eff - problem.params.phi_eff) < np.deg2rad(0.5)
+
+    I_total = problem.I_total_true
+    assert np.isclose(coinverter.solution[0], I_total, rtol=0.02)
+    error = coinverter.fitted_streamfunction - problem.streamfunction_true
+    assert np.sqrt(np.mean(error**2)) < 0.05 * I_total
+
+    n_data = problem.data.size
+    chi2 = np.mean((coinverter.prediction - problem.data) ** 2) / problem.noise_sigma**2
+    chi2_min = 1.0 - coinverter.solution.size / n_data - 3 * np.sqrt(2 / n_data)
+    assert chi2_min < chi2 < 1.05
+
+
+@pytest.mark.slow
+def test_coinv2d_recovery_mismatch(coinv2d_problem_mismatch, make_coinverter2d):
+    problem = coinv2d_problem_mismatch
+    res = make_coinverter2d(problem).fit(n_steps_sensor=500, n_steps_current=500)
+    h, _, _, phi_eff = res["final_sensor_parameters"]
+
+    assert abs(h - problem.params.height) < 0.01
+    assert abs(phi_eff - problem.params.phi_eff) < np.deg2rad(0.5)
+
+
+def test_coinv2d_contract(coinv2d_problem, make_coinverter2d, capsys, single_thread):
+    # Note: need to run on single thread to ensure deterministic output before/after
+    # reset.
+    class RecordingCallback:
+        def __init__(self):
+            self.steps = []
+            self.finishes = 0
+
+        def on_step(self, state):
+            self.steps.append(state)
+
+        def on_finish(self, state):
+            self.finishes += 1
+
+    def n_iterations_printed():
+        out = capsys.readouterr().out
+        return sum(line.startswith("Iteration ") for line in out.splitlines())
+
+    problem = coinv2d_problem
+    n_vertices = len(problem.meshtogrid.mesh.vertices)
+    cb = RecordingCallback()
+    coinverter = make_coinverter2d(
+        problem, crossvalidation_size=1, callback=cb, callback_every=1, verbose=True
+    )
+
+    res1 = coinverter.fit(n_steps_sensor=4)
+    n_iter1 = n_iterations_printed()
+    params_first = np.copy(coinverter.sensor_parameters)
+    res2 = coinverter.fit(n_steps_sensor=4)
+    n_iter2 = n_iterations_printed()
+
+    # Callbacks
+    assert len(cb.steps) == n_iter1 + n_iter2
+    assert cb.finishes == 2
+    steps = [state.step for state in cb.steps]
+    assert all(a < b for a, b in zip(steps, steps[1:], strict=False))
+    for state in cb.steps:
+        assert np.isclose(state.loss, state.fidelity + state.regularization, rtol=1e-5)
+        assert state.streamfunction.shape == (n_vertices,)
+        assert state.predicted_signal.shape == problem.data.shape
+
+    # Continuation: second fit starts where the first ended
+    assert res2["steps_total"] == res1["steps"] + res2["steps"]
+    assert np.isclose(
+        coinverter.history.height_history[res1["steps"]], params_first[0], atol=1e-6
+    )
+
+    # Reset
+    coinverter.reset()
+    assert coinverter.solution is None
+    assert coinverter.fitted_streamfunction is None
+    assert len(coinverter.history.height_history) == 0
+    coinverter.fit(n_steps_sensor=4)
+    assert np.allclose(coinverter.sensor_parameters, params_first, atol=1e-6)
+
+    # Cached and uncached kernels give the same fit
+    no_cache = make_coinverter2d(problem, crossvalidation_size=1, cache_kernels=False)
+    no_cache.fit(n_steps_sensor=4)
+    assert np.allclose(no_cache.sensor_parameters, params_first, atol=1e-5)
+
+
+def test_coinv2d_convergence_checker(coinv2d_problem, make_coinverter2d):
+    checker = backward.CoinversionConvergenceChecker(
+        objtol=np.inf,
+        fidtol=np.inf,
+        heighttol=np.inf,
+        phitol=np.inf,
+        nwindow=3,
+        nextrapolate=None,
+    )
+    coinverter = make_coinverter2d(
+        coinv2d_problem, crossvalidation_size=1, convergence_checker=checker
+    )
+    res = coinverter.fit()
+
+    assert res["message"] == "converged"
+    assert res["steps"] < 10
+    assert "StopIteration" in res["optimizer_message"]
+
+
+@pytest.mark.slow
+def test_coinv2d_initial_streamfunction(coinv2d_problem, make_coinverter2d):
+    problem = coinv2d_problem
+    zero_start = make_coinverter2d(problem, crossvalidation_size=1)
+    true_start = make_coinverter2d(
+        problem,
+        crossvalidation_size=1,
+        initial_streamfunction=problem.streamfunction_true,
+    )
+
+    h_zero, _, _, phi_zero = zero_start.sensor_parameters
+    h_true, _, _, phi_true = true_start.sensor_parameters
+    assert abs(h_true - h_zero) < 0.01
+    assert abs(phi_true - phi_zero) < np.deg2rad(0.5)
+
+
+# --------------------------
+# Coinversion2D unit tests
+# --------------------------
+
+
+@pytest.mark.parametrize("invert_scan", [False, True])
+def test_cached_vs_explicit_kernels_2d(invert_scan, request, make_coinverter2d):
+    problem = request.getfixturevalue(
+        "coinv2d_problem_inverted" if invert_scan else "coinv2d_problem"
+    )
+    coinverter = make_coinverter2d(
+        problem, initial_height=0.6, initial_phi_eff=np.deg2rad(-50.0)
+    )
+
+    rng = np.random.default_rng(1)
+    n_vertices = len(problem.meshtogrid.mesh.vertices)
+    sv = torch.from_numpy(rng.standard_normal(n_vertices)).to(backward.DTYPE)
+    sp = coinverter._full_sensor_parameters(coinverter._sensor_parameters_free.detach())
+
+    with torch.no_grad():
+        explicit = coinverter._signal(sv, sp, use_cached_kernels=False)
+        stale = coinverter._signal(sv, sp, use_cached_kernels=True)
+        coinverter._cache_kernels_into_forward(
+            coinverter._sensor_parameters_free, coinverter._currentforward
+        )
+        cached = coinverter._signal(sv, sp, use_cached_kernels=True)
+
+    scale = explicit.abs().max()
+    assert not torch.allclose(stale, explicit, rtol=0, atol=1e-2 * scale)
+    assert torch.allclose(cached, explicit, rtol=0, atol=1e-5 * scale)
+
+
+@pytest.mark.parametrize("use_cg", [True, False])
+@pytest.mark.parametrize("K", [1, 2])
+def test_coinv2d_hypergradient_fd(
+    use_cg, K, coinv2d_problem, make_coinverter2d, monkeypatch
+):
+    captured = {}
+
+    def stub_minimize(fun, x0, **kwargs):
+        captured["fun"] = fun
+        return scipy.optimize.OptimizeResult(x=x0, success=True, message="stub")
+
+    monkeypatch.setattr(backward.scipy.optimize, "minimize", stub_minimize)
+    coinverter = make_coinverter2d(
+        coinv2d_problem, crossvalidation_size=K, use_cg=use_cg
+    )
+    coinverter.fit(n_steps_sensor=1, n_steps_current=500)
+    theta0 = (
+        coinverter._sensor_parameters_free.detach().cpu().numpy().astype(np.float64)
+    )
+
+    def evaluate(theta):
+        coinverter.reset()  # fresh inner solves, so the score is path-independent
+        return captured["fun"](theta)
+
+    _, grad = evaluate(theta0)
+    delta = 1e-2
+    fd = np.array(
+        [
+            (evaluate(theta0 + delta * e)[0] - evaluate(theta0 - delta * e)[0])
+            / (2 * delta)
+            for e in np.eye(2)
+        ]
+    )
+    assert np.allclose(grad, fd, rtol=0.1, atol=1e-2 * np.max(np.abs(fd)))
+
+
+def test_folds_2d(coinv2d_problem, make_coinverter2d):
+    ((train, test),) = make_coinverter2d(coinv2d_problem, crossvalidation_size=1)._folds
+    assert train.all()
+    assert test.all()
+
+    folds = make_coinverter2d(coinv2d_problem, crossvalidation_size=2)._folds
+    assert len(folds) == 2
+    for train, test in folds:
+        assert torch.equal(train, ~test)
+        assert not (test[1:, :] & test[:-1, :]).any()
+        assert not (test[:, 1:] & test[:, :-1]).any()
+    assert (folds[0][1] ^ folds[1][1]).all()
+
+
+def test_constructor_2d(coinv2d_problem, make_coinverter2d):
+    params = coinv2d_problem.params
+    with pytest.raises(ValueError):
+        make_coinverter2d(
+            coinv2d_problem, initial_height=0.1, initial_phi_eff=np.deg2rad(80.0)
+        )
+
+    coinverter = make_coinverter2d(
+        coinv2d_problem, initial_height=0.9, initial_phi_eff=np.deg2rad(80.0)
+    )
+    h, rho1, rho2, phi_eff = coinverter.sensor_parameters
+    assert np.isclose(h, 0.9)
+    assert np.isclose(rho1, params.rho1)
+    assert np.isclose(rho2, params.rho2)
+    assert np.isclose(phi_eff, np.deg2rad(80.0))
+    assert coinverter.solution is None
+    assert coinverter.fitted_streamfunction is None
+    with pytest.raises(ValueError):
+        _ = coinverter.prediction
+
+
+@pytest.mark.parametrize("cls", [backward.Inverter2D, backward.Coinversion2D])
+def test_initial_streamfunction_validation(cls, coinv2d_problem):
+    problem = coinv2d_problem
+    mesh = problem.meshtogrid.mesh
+    good = problem.streamfunction_true
+
+    bad_left = good.copy()
+    bad_left[mesh.dirichletleft_mask] = 1.0
+    bad_right = good.copy()
+    bad_right[np.flatnonzero(mesh.dirichletright_mask)[0]] += 1.0
+
+    for bad in (good[:-1], bad_left, bad_right):
+        with pytest.raises(ValueError):
+            cls(
+                problem.meshtogrid,
+                problem.currentforward,
+                problem.data,
+                initial_streamfunction=bad,
+            )
+
+    obj = cls(
+        problem.meshtogrid,
+        problem.currentforward,
+        problem.data,
+        initial_streamfunction=good,
+    )
+    if cls is backward.Inverter2D:
+        sv = obj._solution_to_streamvector()
+    else:
+        sv = obj._solution_to_streamvector(obj._solutions[0])
+    assert np.allclose(sv.detach().cpu().numpy(), good, atol=1e-5)
+
+
+@pytest.mark.parametrize("lumped_mass", [True, False])
+def test_regularizers_match_inverter2d(lumped_mass, coinv2d_problem):
+    p = coinv2d_problem
+    inverter = backward.Inverter2D(
+        p.meshtogrid, p.currentforward, p.data, lumped_mass=lumped_mass
+    )
+    coinverter = backward.Coinversion2D(
+        p.meshtogrid, p.currentforward, p.data, lumped_mass=lumped_mass
+    )
+
+    rng = np.random.default_rng(0)
+    sv = torch.from_numpy(rng.standard_normal(len(p.meshtogrid.mesh.vertices))).to(
+        backward.DTYPE
+    )
+    for name in (
+        "_tikhonov_regularization",
+        "_tv_regularization",
+        "_vorticity_regularization",
+    ):
+        assert torch.isclose(
+            getattr(inverter, name)(sv), getattr(coinverter, name)(sv), rtol=1e-6
+        )
