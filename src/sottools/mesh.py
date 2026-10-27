@@ -652,6 +652,765 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
         """
         return self._mass_matrix
 
+class SimplyConnectedFreestandingMesh(SingleBodyMesh):
+    """2D FEM mesh for simply connected freestanding geometries.
+
+    A 2D FEM mesh catered to simply connected (hole-free) geometries that represent
+    superconducting or magnetic microstructures not connected to any source or sink
+    outside the field of view.
+
+    Pre-defines basis functions, gradients and matrices such that FEM problems
+    and calculations can easily be set up.
+
+    Because there are no sources or sinks, the mesh does not have any boundary
+    markers.
+
+    Parameters
+    ----------
+    vertices : list[list[float]]
+        List of 2D coordinates. These are the outer points of the geometry.
+    segments: list[list[int]]
+        List of vertex index pairs defining which vertices are connected.
+    max_area: float
+        Maximum area of a single mesh cell, enforced in the triangulation.
+        Defaults to 0.1
+    min_angle: float
+        Minimum angle of a single mesh cell, enforced in the triangulation.
+        Defaults to 30.0 degrees.
+    verbose: bool
+        If true, debug messages are printed to console. Defaults to False.
+    refine_distance: float or None
+        If not none, the outer boundary gets subdivided until the smallest
+        boundary segement has length refine_distance. Essential if a fine
+        meshing at the edge, e.g. for London problems, is desired.
+
+    Notes
+    -----
+    This class differs from SimplyConnectedCurrentMesh only in its use of boundary
+    markers, and for sottools v1.0.0 we fix the following TODO: inherit both from a
+    new SimplyConnectedMesh base class.
+    """
+
+    def __init__(
+        self,
+        vertices: list[list[float]],
+        segments: list[list[int]],
+        max_area: float = 0.1,
+        min_angle: float = 30.0,
+        verbose: bool = False,
+        refine_distance: float | None = None,
+    ):
+        if verbose:
+            print("Triangulating mesh...")
+            start_time = time.time()
+
+        # Refine
+        if refine_distance is not None:
+            fine_mesh_data = self._refine_boundary(
+                vertices, segments, refine_distance
+            )
+        else:
+            fine_mesh_data = (
+                vertices,
+                segments,
+            )
+        vertices_fine, segments_fine = fine_mesh_data
+
+        meshdict = triangle.triangulate(
+            {
+                "vertices": vertices_fine,
+                "segments": segments_fine
+            },
+            f"pq{min_angle}a{max_area}n",
+        )
+
+        if verbose:
+            print(f"Triangulation completed in {time.time() - start_time:.2f} seconds")
+            print("Next step: calculating matrices...")
+            start_time = time.time()
+
+        self._vertices: np.ndarray = meshdict["vertices"]
+        self._triangles: np.ndarray = meshdict["triangles"]
+        self._neighbors: np.ndarray = meshdict["neighbors"]
+        self._segments: np.ndarray = meshdict["segments"]
+        self._boundary_vertices = np.array(vertices)
+
+        # Cell areas
+        self._areas = self._cell_areas()
+        assert (self._areas > 0).all(), "CW triangle(s) found"
+
+        # Cell centers
+        self._centers = self._cell_centers()
+
+        # Cell gradients per vertex
+        self._shapegradients = self._computeshapegradients()
+        assert np.allclose(self._shapegradients.sum(axis=1), 0)
+
+        # Find masks
+        self._dirichlet_mask = self._dirichletmask()
+        self._free_mask = ~self._dirichlet_mask
+        self._free_idx = np.where(self._free_mask)[0]
+        self._dirichlet_idx = np.where(self._dirichlet_mask)[0]
+
+        # Cache matrices and operators
+        self._edges, self._interior_edges, self._boundary_edges, \
+            self._interior_edge_mask, self._boundary_edge_mask, \
+            self._internaledgelengths, self._edgedifference_operator = self._compute_edges()
+
+        self._edge_vectors = self._vertices[self._edges[:, 1]] - self._vertices[self._edges[:, 0]]
+        self._edge_midpoints = (self._vertices[self._edges[:, 0]] + self._vertices[self._edges[:, 1]]) / 2
+        self._edge_lengths = np.linalg.norm(self._edge_vectors, axis=1)
+
+        self._gradient_operator_x, self._gradient_operator_y = self._gradientoperators(
+            self._shapegradients
+        )
+        self._stiffness_matrix = self._stiffnessmatrix(self._shapegradients)
+        self._stiffness_matrix_solver = self._freesolver(
+            self.stiffness_matrix, self.free_idx
+        )  # Caches the (N_free, N_free) part of this matrix for quick solving
+        self._mass_matrix = self._massmatrix()
+
+        self._barycentric_areas = self._compute_barycentric_areas() # (N_v,)
+        self._cotangent_weights = self._compute_cotangent_weights() # (N_e, )
+
+        self._triangle_edges, self._triangle_edge_signs = self._compute_triangle_edges() # (N_t, 3), with edge k opposing vertex k
+        sign_sum = np.bincount(self._triangle_edges.ravel(), weights=self._triangle_edge_signs.ravel(),
+                               minlength=len(self.edges))
+        assert np.all(sign_sum[self._interior_edge_mask] == 0)
+        assert np.all(np.abs(sign_sum[self._boundary_edge_mask]) == 1)
+
+        # The Whitney operators map from edge-based fields to triangle-based fields.
+        self._whitney_operator_x, self._whitney_operator_y = self._compute_whitney_operators() # (N_e, N_t)
+
+
+        N_v = self.vertices.shape[0]
+        N_t = self.triangles.shape[0]
+        N_e = self.edges.shape[0]
+        assert N_e == N_v + N_t - 1, "Euler's formula for planar graphs not satisfied"
+        assert self._cotangent_weights[self._interior_edge_mask].min() > -1e-10 * self._cotangent_weights.max(), \
+            "Negative interior cotangent weight"
+
+        if verbose:
+
+            print(f"Matrices calculated in {time.time() - start_time:.2f} seconds")
+            print("Number of vertices:", N_v)
+            print("Number of triangles:", N_t)
+
+    def __getstate__(self) -> dict[str, object]:
+        """Conversion of object to dictionary.
+
+        Special care must be taken here because SuperLU objects cannot be
+        converted to a dictionary, and can then not be pickled.
+
+        Returns
+        -------
+        state: dict
+            Dictionary representation of the object.
+        """
+        state = self.__dict__.copy()
+        del state["_stiffness_matrix_solver"]  # SuperLU can't be pickled
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Conversion of dictionary to object.
+
+        Special care must be taken here because SuperLU objects cannot be
+        converted to a dictionary, and can then not be pickled.
+
+        Parameters
+        ----------
+        state: dict
+            Dictionary representation of the object.
+        """
+        self.__dict__.update(state)
+        # Recompute the factorization
+        self._stiffness_matrix_solver = self._freesolver(
+            self.stiffness_matrix, self.free_idx
+        )
+
+    @staticmethod
+    def _refine_boundary(
+        vertices: list[list[float]],
+        segments: list[list[int]],
+        edge_spacing: float = 0.05,
+    ) -> tuple[list[list[float]], list[list[int]]]:
+        """Refines outer boundary of the mesh.
+
+        Parameters
+        ----------
+        vertices: list[list[float]]
+            List of 2D coordinates. These are the outer points of the geometry.
+        segments: list[list[int]]
+            List of vertex index pairs defining which vertices are connected.
+        edge_spacing: float
+            Desired spacing between vertices on the boundary. Defaults to 0.05.
+        """
+        new_vertices = list(vertices)
+        new_segments = []
+
+        for seg in segments:
+            p0 = np.array(vertices[seg[0]], dtype=float)
+            p1 = np.array(vertices[seg[1]], dtype=float)
+            length = np.linalg.norm(p1 - p0)
+            n_subdivisions = max(1, int(np.ceil(length / edge_spacing)))
+
+            idx_start = seg[0]
+            for i in range(1, n_subdivisions):
+                t = i / n_subdivisions
+                new_point = (1 - t) * p0 + t * p1
+                idx_new = len(new_vertices)
+                new_vertices.append(new_point.tolist())
+                new_segments.append([idx_start, idx_new])
+                idx_start = idx_new
+
+            new_segments.append([idx_start, seg[1]])
+
+        return new_vertices, new_segments
+
+    def _cell_areas(self) -> np.ndarray:
+        """Signed areas: positive for counter-clockwise oriented triangles."""
+        v0s = self.vertices[self.triangles[:, 0]]
+        v1s = self.vertices[self.triangles[:, 1]]
+        v2s = self.vertices[self.triangles[:, 2]]
+
+        bs = v1s - v0s
+        cs = v2s - v0s
+        areas: np.ndarray = 0.5 * (bs[:, 0] * cs[:, 1] - bs[:, 1] * cs[:, 0])
+
+        return areas
+
+    def _cell_centers(self) -> np.ndarray:
+        v0s = self.vertices[self.triangles[:, 0]]
+        v1s = self.vertices[self.triangles[:, 1]]
+        v2s = self.vertices[self.triangles[:, 2]]
+
+        centers: np.ndarray = (v0s + v1s + v2s) / 3
+        return centers
+
+    def _computeshapegradients(self) -> np.ndarray:
+        v0s = self.vertices[self.triangles[:, 0]]
+        v1s = self.vertices[self.triangles[:, 1]]
+        v2s = self.vertices[self.triangles[:, 2]]
+
+        b = np.column_stack(
+            [v1s[:, 1] - v2s[:, 1], v2s[:, 1] - v0s[:, 1], v0s[:, 1] - v1s[:, 1]]
+        )  # (N_t, 3)
+        c = np.column_stack(
+            [v2s[:, 0] - v1s[:, 0], v0s[:, 0] - v2s[:, 0], v1s[:, 0] - v0s[:, 0]]
+        )  # (N_t, 3)
+
+        shapegrads: np.ndarray = (
+            np.stack([b, c], axis=-1) / (2 * self._areas)[:, None, None]
+        )
+        return shapegrads
+
+    def _dirichletmask(self) -> np.ndarray:
+        N_v = self.vertices.shape[0]
+        dirichletmask = np.zeros(N_v, dtype=bool)
+        verts = np.unique(self._segments[:].ravel())
+        dirichletmask[verts] = True
+        return dirichletmask
+
+    def _compute_edges(
+        self,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        scipy.sparse.csr_matrix,
+    ]:
+        internal_edges = []  # (t1, t2) triangle pairs where t1 and t2 share an edge
+        internal_edge_vertices = []  # (v1, v2) vertex pairs for each internal edge
+        boundary_edges = []  # (v1, v2) vertex pairs for each boundary edge
+
+        for t, tri in enumerate(self.triangles):
+            for i in range(3):
+                v1, v2 = tri[(i + 1) % 3], tri[(i + 2) % 3]
+                neighbor = self.neighbors[t, i]
+                if neighbor != -1:
+                    if t < neighbor:  # Avoid double counting
+                        internal_edges.append((t, neighbor))
+                        internal_edge_vertices.append((v1, v2))
+                else:
+                    boundary_edges.append((v1, v2))
+
+        (internal_edges_arr, internal_edge_vertices_arr) = (
+            np.array(internal_edges),
+            np.array(internal_edge_vertices),
+        )
+
+        internal_edge_lengths = np.linalg.norm(
+            self.vertices[internal_edge_vertices_arr[:, 0]]
+            - self.vertices[internal_edge_vertices_arr[:, 1]],
+            axis=1,
+        )
+
+        N_t = self.triangles.shape[0]
+        N_e = len(internal_edges)
+
+        rows = np.arange(N_e)[:, None].repeat(2, axis=1)  # (N_e, 2)
+        cols = internal_edges_arr.ravel()  # (N_e, 2)
+        edge_difference_operator = scipy.sparse.coo_matrix(
+            (np.array([1, -1] * N_e), (rows.ravel(), cols.ravel())), shape=(N_e, N_t)
+        ).tocsr()
+
+        all_edges = np.vstack([internal_edge_vertices_arr, boundary_edges])
+
+        # We now have all_edges, internal_edge_vertices, and boundary_edges
+        # Both consist of vertex index pairs. We now enforce ordering such that the
+        # first index is always smaller than the second.
+        for i in range(all_edges.shape[0]):
+            if all_edges[i, 0] > all_edges[i, 1]:
+                all_edges[i] = all_edges[i][::-1]
+        for i in range(internal_edge_vertices_arr.shape[0]):
+            if internal_edge_vertices_arr[i, 0] > internal_edge_vertices_arr[i, 1]:
+                internal_edge_vertices_arr[i] = internal_edge_vertices_arr[i][::-1]
+        for i in range(len(boundary_edges)):
+            if boundary_edges[i][0] > boundary_edges[i][1]:
+                boundary_edges[i] = boundary_edges[i][::-1]
+
+        # Because all boundary edges come after all internal edges, masking is easy:
+        internal_edges_mask = np.zeros(len(all_edges), dtype=bool)
+        internal_edges_mask[:len(internal_edge_vertices_arr)] = True
+        boundary_edges_mask = ~internal_edges_mask
+
+        return (all_edges,
+                internal_edge_vertices_arr,
+                np.array(boundary_edges),
+                internal_edges_mask,
+                boundary_edges_mask,
+                internal_edge_lengths,
+                edge_difference_operator,
+                )
+
+    def _compute_triangle_edges(self) -> tuple[np.ndarray, np.ndarray]:
+        """Compute the edges of each triangle in the mesh.
+
+        Returns a (N_t, 3) array containing the edge indices of each triangle.
+        The edge index corresponds to the edge opposing the vertex with the same index.
+        """
+        N_t = self.triangles.shape[0]
+        N_v = self.vertices.shape[0]
+        tri = self.triangles.astype(np.int64)            # int64: keys reach N_v**2
+        a = tri[:, [1, 2, 0]]                            # (N_t, 3) start of local edge k
+        b = tri[:, [2, 0, 1]]                            # (N_t, 3) end of local edge k
+
+        edge_keys = self.edges[:, 0].astype(np.int64) * N_v + self.edges[:, 1]
+        order = np.argsort(edge_keys)
+        local_keys = np.minimum(a, b) * N_v + np.maximum(a, b)
+        triangle_edges = order[np.searchsorted(edge_keys[order], local_keys)]
+        triangle_edge_signs = np.where(a < b, 1, -1)
+
+        return triangle_edges, triangle_edge_signs
+
+    def _compute_whitney_operators(self) -> tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
+        N_t = self.triangles.shape[0]
+        N_e = self.edges.shape[0]
+        grads = self._shapegradients  # (N_t, 3, 2)
+        lengths = self._edge_lengths[self._triangle_edges]  # (N_t, 3)
+        C = (lengths * self._triangle_edge_signs)[:, :, None] / 3 \
+            * (grads[:, [2, 0, 1]] - grads[:, [1, 2, 0]])  # (N_t, 3, 2)
+
+        rows = np.arange(N_t)[:, None].repeat(3, axis=1)  # (N_t, 3)
+        cols = self._triangle_edges  # (N_t, 3)
+        whitney_x = scipy.sparse.coo_matrix(
+            (C[:, :, 0].ravel(), (rows.ravel(), cols.ravel())), shape=(N_t, N_e)
+        ).tocsr()
+        whitney_y = scipy.sparse.coo_matrix(
+            (C[:, :, 1].ravel(), (rows.ravel(), cols.ravel())), shape=(N_t, N_e)
+        ).tocsr()
+        return whitney_x, whitney_y
+
+    def _gradientoperators(
+        self, shapegradients: np.ndarray
+    ) -> tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
+        N_v = self.vertices.shape[0]
+        N_t = self.triangles.shape[0]
+
+        tri_idx = np.arange(N_t)[:, None].repeat(3, axis=1)  # (N_t, 3)
+        ver_idx = self.triangles  # (N_t, 3)
+
+        gradient_operator_x = scipy.sparse.coo_matrix(
+            (shapegradients[:, :, 0].ravel(), (tri_idx.ravel(), ver_idx.ravel())),
+            shape=(N_t, N_v),
+        ).tocsr()
+        gradient_operator_y = scipy.sparse.coo_matrix(
+            (shapegradients[:, :, 1].ravel(), (tri_idx.ravel(), ver_idx.ravel())),
+            shape=(N_t, N_v),
+        ).tocsr()
+
+        return gradient_operator_x, gradient_operator_y
+
+    def _stiffnessmatrix(self, shapegradients: np.ndarray) -> scipy.sparse.csr_matrix:
+        N_v = self.vertices.shape[0]
+
+        K_t = np.einsum("tiu,tju->tij", shapegradients, shapegradients)  # (N_t, 3, 3)
+        K_t *= self._areas[:, None, None]  # Scale by area
+        rows = self.triangles[:, :, None].repeat(3, axis=2)  # (N_t, 3, 3)
+        cols = self.triangles[:, None, :].repeat(3, axis=1)  # (N_t, 3, 3)
+        K = scipy.sparse.coo_matrix(
+            (K_t.ravel(), (rows.ravel(), cols.ravel())), shape=(N_v, N_v)
+        ).tocsr()
+
+        return K
+
+    def _freesolver(
+        self, matrix: scipy.sparse.csr_matrix, free_idx: np.ndarray
+    ) -> scipy.sparse.linalg.SuperLU:
+        matrix_free = matrix[free_idx][:, free_idx]
+        solver = scipy.sparse.linalg.splu(matrix_free.tocsc())
+        return solver
+
+    def _massmatrix(self) -> scipy.sparse.csr_matrix:
+        N_v = self.vertices.shape[0]
+
+        local_M = (
+            np.where(
+                np.eye(3, dtype=bool)[None, :, :],  # (1,3,3)
+                1 / 6,  # diagonal entries
+                1 / 12,  # off-diagonal entries
+            )
+            * self._areas[:, None, None]
+        )  # (N_t, 3, 3)
+
+        rows = self.triangles[:, :, None].repeat(3, axis=2)  # (N_t, 3, 3)
+        cols = self.triangles[:, None, :].repeat(3, axis=1)  # (N_t, 3, 3)
+        M = scipy.sparse.coo_matrix(
+            (local_M.ravel(), (rows.ravel(), cols.ravel())), shape=(N_v, N_v)
+        ).tocsr()
+
+        return M
+
+    def _compute_barycentric_areas(self) -> np.ndarray:
+        """Compute the barycentric areas for each vertex in the mesh.
+
+        Returns a (N_v,) array containing the barycentric areas of the vertices.
+        """
+        N_v = self.vertices.shape[0]
+        barycentric_areas: np.ndarray = np.bincount(
+            self.triangles.ravel(),                 # (3 N_t,) vertex index of each triangle corner
+            weights=np.repeat(self.areas / 3, 3),   # (3 N_t,) one third of that triangle's area
+            minlength=N_v,
+        )
+        return barycentric_areas
+
+    def _compute_cotangent_weights(self) -> np.ndarray:
+        """Computes the cotangent weight w_ij for all edges e_ij.
+
+        We sort all edges inside self._edges where each entry is an edge e_ij with
+        i < j. The cotangent weight w_ij belonging to edge e_ij is simply -1x the
+        value of the stiffness matrix K_ij. By sorting this into an array of
+        (N_e,) we can easily write vectorize sums over edges."""
+        K_edges = self.stiffness_matrix[self.edges[:, 0], self.edges[:, 1]]  # (1, N_e)
+        cotangent_weights: np.ndarray = -np.asarray(K_edges).ravel()
+        return cotangent_weights
+
+    def field_curl(
+        self,
+        field: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Calculate the curl of a field defined on the vertices.
+
+        Represents the operation v = nabla x (f zhat), where the field f
+        is a scalar field defined on the vertices. This is exactly how
+        streamfunctions are related to sheet current densities in 2D.
+
+        Parameters
+        ----------
+        field: np.ndarray
+            Field defined on the vertices of the mesh. Shape (N_v,).
+
+        Returns
+        -------
+        Kx: np.ndarray
+            x-component of the curl of the field, defined on the cell
+            centers. Shape (N_t,).
+        Ky: np.ndarray
+            y-component of the curl of the field, defined on the cell
+            centers. Shape (N_t,).
+        """
+        field_ts = field[self.triangles]
+        grad_field = (field_ts[:, :, None] * self._shapegradients).sum(axis=1)
+        Kx = grad_field[:, 1]
+        Ky = -grad_field[:, 0]
+        return Kx, Ky
+
+    @property
+    def vertices(self) -> np.ndarray:
+        """Vertices of the mesh.
+
+        Returns a (N_v,2) array of vertex coordinates.
+        """
+        return self._vertices
+
+    @property
+    def triangles(self) -> np.ndarray:
+        """Triangulation of the mesh.
+
+        Returns a (N_t,3) array containing the vertex indices of a triangle.
+        """
+        return self._triangles
+
+    @property
+    def areas(self) -> np.ndarray:
+        """Areas of the triangles in the mesh.
+
+        Returns a (N_t,) array containing the areas of the triangles.
+        """
+        return self._areas
+
+    @property
+    def centers(self) -> np.ndarray:
+        """Centers of the triangles in the mesh.
+
+        Returns a (N_t,2) array containing the coordinates of the triangle centers.
+        """
+        return self._centers
+
+    @property
+    def neighbors(self) -> np.ndarray:
+        """Neighbor relationships between triangles.
+
+        Returns a (N_t,3) array containing the triangle indices of the
+        neighbors of a triangle.
+        """
+        return self._neighbors
+
+    @property
+    def boundary_vertices(self) -> np.ndarray:
+        """Vertices on the boundary of the mesh.
+
+        Returns a (N_b,2) array containing the coordinates of the boundary vertices.
+        """
+        return self._boundary_vertices
+
+    @property
+    def boundary_segments(self) -> np.ndarray:
+        """Boundary segments of the mesh.
+
+        Returns a (N_s, 2) array of vertex index pairs defining boundary edges.
+        """
+        return self._segments
+
+    @property
+    def shapegradients(self) -> np.ndarray:
+        """Gradients of the basis functions.
+
+        Returns a (N_t,3,2) array containing the gradients of the P1
+        linear basis functions for each triangle.
+        """
+        return self._shapegradients
+
+    @property
+    def dirichlet_mask(self) -> np.ndarray:
+        """Mask for all Dirichlet boundary conditions on the mesh.
+
+        Returns a boolean array of length N_v, where True indicates a vertex
+        is part of the boundary.
+        """
+        return self._dirichlet_mask
+
+    @property
+    def free_mask(self) -> np.ndarray:
+        """Mask for free vertices (not on Dirichlet boundaries) of the mesh.
+
+        Returns a boolean array of length N_v, where True indicates a vertex
+        is part of the free vertices.
+        """
+        return self._free_mask
+
+    @property
+    def free_idx(self) -> np.ndarray:
+        """Indices of free vertices (not on Dirichlet boundaries) of the mesh."""
+        return self._free_idx
+
+    @property
+    def dirichlet_idx(self) -> np.ndarray:
+        """Indices of Dirichlet vertices (on Dirichlet boundaries) of the mesh."""
+        return self._dirichlet_idx
+
+    @property
+    def internaledgelengths(self) -> np.ndarray:
+        """Lengths of the internal edges of the mesh.
+
+        Returns a (N_e,) array containing the lengths of the internal edges of
+        the mesh.
+        """
+        return self._internaledgelengths
+
+    @property
+    def edgedifference_operator(self) -> scipy.sparse.csr_matrix:
+        """Operator for the difference of a field across internal.
+
+        This csr matrix represents a matrix of shape (N_e, N_t) that calculates
+        the difference of a field across internal edges.
+        """
+        return self._edgedifference_operator
+
+    @property
+    def gradient_operator_x(self) -> scipy.sparse.csr_matrix:
+        """Operator for the x-gradient of a field.
+
+        This csr matrix represents a matrix of shape (N_t, N_v) that calculates
+        the x-gradient of a field defined on the vertices.
+        """
+        return self._gradient_operator_x
+
+    @property
+    def gradient_operator_y(self) -> scipy.sparse.csr_matrix:
+        """Operator for the y-gradient of a field.
+
+        This csr matrix represents a matrix of shape (N_t, N_v) that calculates
+        the y-gradient of a field defined on the vertices.
+        """
+        return self._gradient_operator_y
+
+    @property
+    def stiffness_matrix(self) -> scipy.sparse.csr_matrix:
+        """Stiffness matrix of the mesh.
+
+        This csr matrix represents a matrix of shape (N_v, N_v) that calculates
+        the stiffness, where the (i,j) component is the integral of the product
+        of the gradients of the P1 basis functions i and j.
+        """
+        return self._stiffness_matrix
+
+    @property
+    def stiffness_matrix_solver(self) -> scipy.sparse.linalg.SuperLU:
+        """SuperLU solver associated with the free part of the stiffness matrix."""
+        return self._stiffness_matrix_solver
+
+    @property
+    def mass_matrix(self) -> scipy.sparse.csr_matrix:
+        """Mass matrix of the mesh.
+
+        This csr matrix represents a matrix of shape (N_v, N_v) that calculates
+        the mass, where the (i,j) component is the integral of the product of
+        the P1 basis functions i and j.
+        """
+        return self._mass_matrix
+
+    @property
+    def edges(self) -> np.ndarray:
+        """Edges of the mesh.
+
+        Returns a (N_e, 2) array of vertex index pairs defining edges.
+        """
+        return self._edges
+
+    @property
+    def interior_edges(self) -> np.ndarray:
+        """Interior edges of the mesh.
+
+        Returns a (N_ei, 2) array of vertex index pairs defining interior edges.
+        """
+        return self._interior_edges
+
+    @property
+    def boundary_edges(self) -> np.ndarray:
+        """Boundary edges of the mesh.
+
+        Returns a (N_eb, 2) array of vertex index pairs defining boundary edges.
+        """
+        return self._boundary_edges
+
+    @property
+    def interior_edge_mask(self) -> np.ndarray:
+        """Mask for interior edges of the mesh.
+
+        Returns a boolean array of length N_e, where True indicates an edge
+        is an interior edge.
+        """
+        return self._interior_edge_mask
+
+    @property
+    def boundary_edge_mask(self) -> np.ndarray:
+        """Mask for boundary edges of the mesh.
+
+        Returns a boolean array of length N_e, where True indicates an edge
+        is a boundary edge.
+        """
+        return self._boundary_edge_mask
+
+    @property
+    def edge_vectors(self) -> np.ndarray:
+        """Vectors of the edges of the mesh.
+
+        Returns a (N_e, 2) array of vectors corresponding to the edges.
+        """
+        return self._edge_vectors
+
+    @property
+    def edge_midpoints(self) -> np.ndarray:
+        """Midpoints of the edges of the mesh.
+
+        Returns a (N_e, 2) array of midpoints corresponding to the edges.
+        """
+        return self._edge_midpoints
+
+    @property
+    def edge_lengths(self) -> np.ndarray:
+        """Lengths of the edges of the mesh.
+
+        Returns a (N_e,) array of lengths corresponding to the edges.
+        """
+        return self._edge_lengths
+
+    @property
+    def barycentric_areas(self) -> np.ndarray:
+        """Barycentric areas of the vertices of the mesh.
+
+        Returns a (N_v,) array of barycentric areas corresponding to the vertices.
+        """
+        return self._barycentric_areas
+
+    @property
+    def cotangent_weights(self) -> np.ndarray:
+        """Cotangent weights of the edges of the mesh.
+
+        Returns a (N_e,) array of cotangent weights corresponding to the edges.
+        """
+        return self._cotangent_weights
+
+    @property
+    def triangle_edges(self) -> np.ndarray:
+        """Edges of the triangles of the mesh.
+
+        Returns a (N_t, 3) array of edge indices corresponding to the triangles.
+        The edge index corresponds to the edge opposing the vertex with the same index.
+        """
+        return self._triangle_edges
+
+    @property
+    def triangle_edge_signs(self) -> np.ndarray:
+        """Signs of the edges of the triangles of the mesh.
+
+        Returns a (N_t, 3) array of signs corresponding to the triangles.
+        The sign is +1 if the edge is oriented from the first vertex to the second vertex,
+        and -1 if it is oriented from the second vertex to the first vertex.
+        The sign corresponds to the edge opposing the vertex with the same index.
+        """
+        return self._triangle_edge_signs
+
+    @property
+    def whitney_operator_x(self) -> scipy.sparse.csr_matrix:
+        """Whitney operator for the x-component of the edges of the triangles of the mesh.
+
+        Returns a (N_t, N_e) csr matrix that maps edge-based fields to triangle-based fields.
+        """
+        return self._whitney_operator_x
+
+    @property
+    def whitney_operator_y(self) -> scipy.sparse.csr_matrix:
+        """Whitney operator for the y-component of the edges of the triangles of the mesh.
+
+        Returns a (N_t, N_e) csr matrix that maps edge-based fields to triangle-based fields.
+        """
+        return self._whitney_operator_y
+
 
 class LondonSolver:
     """Solver for the London equation in a simply connected geometry.
