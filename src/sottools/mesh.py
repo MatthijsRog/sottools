@@ -652,6 +652,7 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
         """
         return self._mass_matrix
 
+
 class SimplyConnectedFreestandingMesh(SingleBodyMesh):
     """2D FEM mesh for simply connected freestanding geometries.
 
@@ -706,9 +707,7 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
 
         # Refine
         if refine_distance is not None:
-            fine_mesh_data = self._refine_boundary(
-                vertices, segments, refine_distance
-            )
+            fine_mesh_data = self._refine_boundary(vertices, segments, refine_distance)
         else:
             fine_mesh_data = (
                 vertices,
@@ -717,10 +716,7 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         vertices_fine, segments_fine = fine_mesh_data
 
         meshdict = triangle.triangulate(
-            {
-                "vertices": vertices_fine,
-                "segments": segments_fine
-            },
+            {"vertices": vertices_fine, "segments": segments_fine},
             f"pq{min_angle}a{max_area}n",
         )
 
@@ -753,12 +749,22 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         self._dirichlet_idx = np.where(self._dirichlet_mask)[0]
 
         # Cache matrices and operators
-        self._edges, self._interior_edges, self._boundary_edges, \
-            self._interior_edge_mask, self._boundary_edge_mask, \
-            self._internaledgelengths, self._edgedifference_operator = self._compute_edges()
+        (
+            self._edges,
+            self._interior_edges,
+            self._boundary_edges,
+            self._interior_edge_mask,
+            self._boundary_edge_mask,
+            self._internaledgelengths,
+            self._edgedifference_operator,
+        ) = self._compute_edges()
 
-        self._edge_vectors = self._vertices[self._edges[:, 1]] - self._vertices[self._edges[:, 0]]
-        self._edge_midpoints = (self._vertices[self._edges[:, 0]] + self._vertices[self._edges[:, 1]]) / 2
+        self._edge_vectors = (
+            self._vertices[self._edges[:, 1]] - self._vertices[self._edges[:, 0]]
+        )
+        self._edge_midpoints = (
+            self._vertices[self._edges[:, 0]] + self._vertices[self._edges[:, 1]]
+        ) / 2
         self._edge_lengths = np.linalg.norm(self._edge_vectors, axis=1)
 
         self._gradient_operator_x, self._gradient_operator_y = self._gradientoperators(
@@ -770,28 +776,40 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         )  # Caches the (N_free, N_free) part of this matrix for quick solving
         self._mass_matrix = self._massmatrix()
 
-        self._barycentric_areas = self._compute_barycentric_areas() # (N_v,)
-        self._cotangent_weights = self._compute_cotangent_weights() # (N_e, )
+        self._barycentric_areas = self._compute_barycentric_areas()  # (N_v,)
+        self._cotangent_weights = self._compute_cotangent_weights()  # (N_e, )
 
-        self._triangle_edges, self._triangle_edge_signs = self._compute_triangle_edges() # (N_t, 3), with edge k opposing vertex k
-        sign_sum = np.bincount(self._triangle_edges.ravel(), weights=self._triangle_edge_signs.ravel(),
-                               minlength=len(self.edges))
+        self._triangle_edges, self._triangle_edge_signs = (
+            self._compute_triangle_edges()
+        )  # (N_t, 3), with edge k opposing vertex k
+        sign_sum = np.bincount(
+            self._triangle_edges.ravel(),
+            weights=self._triangle_edge_signs.ravel(),
+            minlength=len(self.edges),
+        )
         assert np.all(sign_sum[self._interior_edge_mask] == 0)
         assert np.all(np.abs(sign_sum[self._boundary_edge_mask]) == 1)
 
         # The Whitney operators map from edge-based fields to triangle-based fields.
-        self._whitney_operator_x, self._whitney_operator_y = self._compute_whitney_operators() # (N_e, N_t)
+        self._whitney_operator_x, self._whitney_operator_y = (
+            self._compute_whitney_operators()
+        )  # (N_t, N_e)
 
+        # These operators map from a node-based field (P1) to a circumcentre-based field
+        self._node_to_cc_operator = self._compute_node_to_cc_operator()  # (N_t, N_v)
+        self._node_from_cc_solver, self._BFT = self._compute_node_from_cc_solver()
+        self._flux_operator, self._edge_divergence_operator = self._compute_flux_operators()
 
         N_v = self.vertices.shape[0]
         N_t = self.triangles.shape[0]
         N_e = self.edges.shape[0]
         assert N_e == N_v + N_t - 1, "Euler's formula for planar graphs not satisfied"
-        assert self._cotangent_weights[self._interior_edge_mask].min() > -1e-10 * self._cotangent_weights.max(), \
-            "Negative interior cotangent weight"
+        assert (
+            self._cotangent_weights[self._interior_edge_mask].min()
+            > -1e-10 * self._cotangent_weights.max()
+        ), "Negative interior cotangent weight"
 
         if verbose:
-
             print(f"Matrices calculated in {time.time() - start_time:.2f} seconds")
             print("Number of vertices:", N_v)
             print("Number of triangles:", N_t)
@@ -809,6 +827,7 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         """
         state = self.__dict__.copy()
         del state["_stiffness_matrix_solver"]  # SuperLU can't be pickled
+        del state["_node_from_cc_solver"]  # SuperLU can't be pickled
         return state
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -827,6 +846,7 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         self._stiffness_matrix_solver = self._freesolver(
             self.stiffness_matrix, self.free_idx
         )
+        self._node_from_cc_solver, self._BFT = self._compute_node_from_cc_solver()
 
     @staticmethod
     def _refine_boundary(
@@ -974,17 +994,18 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
 
         # Because all boundary edges come after all internal edges, masking is easy:
         internal_edges_mask = np.zeros(len(all_edges), dtype=bool)
-        internal_edges_mask[:len(internal_edge_vertices_arr)] = True
+        internal_edges_mask[: len(internal_edge_vertices_arr)] = True
         boundary_edges_mask = ~internal_edges_mask
 
-        return (all_edges,
-                internal_edge_vertices_arr,
-                np.array(boundary_edges),
-                internal_edges_mask,
-                boundary_edges_mask,
-                internal_edge_lengths,
-                edge_difference_operator,
-                )
+        return (
+            all_edges,
+            internal_edge_vertices_arr,
+            np.array(boundary_edges),
+            internal_edges_mask,
+            boundary_edges_mask,
+            internal_edge_lengths,
+            edge_difference_operator,
+        )
 
     def _compute_triangle_edges(self) -> tuple[np.ndarray, np.ndarray]:
         """Compute the edges of each triangle in the mesh.
@@ -994,9 +1015,9 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         """
         N_t = self.triangles.shape[0]
         N_v = self.vertices.shape[0]
-        tri = self.triangles.astype(np.int64)            # int64: keys reach N_v**2
-        a = tri[:, [1, 2, 0]]                            # (N_t, 3) start of local edge k
-        b = tri[:, [2, 0, 1]]                            # (N_t, 3) end of local edge k
+        tri = self.triangles.astype(np.int64)  # int64: keys reach N_v**2
+        a = tri[:, [1, 2, 0]]  # (N_t, 3) start of local edge k
+        b = tri[:, [2, 0, 1]]  # (N_t, 3) end of local edge k
 
         edge_keys = self.edges[:, 0].astype(np.int64) * N_v + self.edges[:, 1]
         order = np.argsort(edge_keys)
@@ -1006,13 +1027,18 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
 
         return triangle_edges, triangle_edge_signs
 
-    def _compute_whitney_operators(self) -> tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
+    def _compute_whitney_operators(
+        self,
+    ) -> tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
         N_t = self.triangles.shape[0]
         N_e = self.edges.shape[0]
         grads = self._shapegradients  # (N_t, 3, 2)
         lengths = self._edge_lengths[self._triangle_edges]  # (N_t, 3)
-        C = (lengths * self._triangle_edge_signs)[:, :, None] / 3 \
-            * (grads[:, [2, 0, 1]] - grads[:, [1, 2, 0]])  # (N_t, 3, 2)
+        C = (
+            (lengths * self._triangle_edge_signs)[:, :, None]
+            / 3
+            * (grads[:, [2, 0, 1]] - grads[:, [1, 2, 0]])
+        )  # (N_t, 3, 2)
 
         rows = np.arange(N_t)[:, None].repeat(3, axis=1)  # (N_t, 3)
         cols = self._triangle_edges  # (N_t, 3)
@@ -1091,8 +1117,10 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         """
         N_v = self.vertices.shape[0]
         barycentric_areas: np.ndarray = np.bincount(
-            self.triangles.ravel(),                 # (3 N_t,) vertex index of each triangle corner
-            weights=np.repeat(self.areas / 3, 3),   # (3 N_t,) one third of that triangle's area
+            self.triangles.ravel(),  # (3 N_t,) vertex index of each triangle corner
+            weights=np.repeat(
+                self.areas / 3, 3
+            ),  # (3 N_t,) one third of that triangle's area
             minlength=N_v,
         )
         return barycentric_areas
@@ -1107,6 +1135,106 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         K_edges = self.stiffness_matrix[self.edges[:, 0], self.edges[:, 1]]  # (1, N_e)
         cotangent_weights: np.ndarray = -np.asarray(K_edges).ravel()
         return cotangent_weights
+
+    def _compute_node_to_cc_operator(self) -> scipy.sparse.csr_matrix:
+        """Compute the operator mapping a field on nodes to a field on circumcenters.
+
+        The operator is a sparse matrix of shape (N_t, N_v) with three entries per
+        row, corresponding to the three vertices (nodes) surrounding the triangle. For
+        triangle i and node j, the entry B_ij is the barycentric coordinate
+
+        B_ij = L_j^2(L0^2+L1^2+L2^2 - 2L_j^2) / 16 A_i^2
+
+        where L_j is the length of the edge opposite to node j, and A_i is the area of
+        triangle i.
+
+        This function must be run after _cell_areas has been run and assigned to
+        self._areas. It also requires self._edge_lengths and self._triangle_edges to be
+        pre-computed."""
+
+        # First compute entries, vectorized:
+        Lj = self._edge_lengths[self._triangle_edges]  # (N_t, 3)
+        Ai = self._areas[:, None]  # (N_t, 1)
+        B = (Lj**2 * (np.sum(Lj**2, axis=1, keepdims=True) - 2 * Lj**2)) / (
+            16 * Ai**2
+        )  # (N_t, 3)
+
+        # Then construct sparse matrix:
+        rows = np.arange(self.triangles.shape[0])[:, None].repeat(3, axis=1)  # (N_t, 3)
+        cols = self.triangles  # (N_t, 3)
+        node_to_cc_operator = scipy.sparse.coo_matrix(
+            (B.ravel(), (rows.ravel(), cols.ravel())),
+            shape=(self.triangles.shape[0], self.vertices.shape[0]),
+        ).tocsr()
+        return node_to_cc_operator
+
+    def _compute_node_from_cc_solver(
+        self,
+    ) -> tuple[scipy.sparse.linalg.SuperLU, scipy.sparse.csr_matrix]:
+        """Compute a solver to map a field on circumcenters to a field on nodes.
+
+        In this problem (see the documentation of nodes_from_triangles), we require
+        a solver for both B_f^T B_f and the sparse matrix B_f^T, where B_f is the
+        (N_t, N_free) submatrix of the operator mapping a field on nodes to a field on
+        circumcenters. This function computes both.
+
+        This function must be run after _compute_node_to_cc_operator has been run and
+        assigned to self._node_to_cc_operator. It also requires self._free_idx to be
+        pre-computed."""
+
+        B_f = self._node_to_cc_operator[:, self.free_idx]  # (N_t, N_free)
+        lhs = B_f.T @ B_f  # (N_free, N_free)
+        solver = scipy.sparse.linalg.splu(lhs.tocsc())
+        B_f_T = B_f.T.tocsr()  # (N_free, N_t)
+
+        diag = lhs.diagonal()  # (N_free,)
+        assert diag.min() > 1e-8 * diag.max(), (
+            "Singular circumcentre fit: free vertex without weight"
+        )
+
+        return solver, B_f_T
+
+    def _compute_flux_operators(self) -> tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
+        """Compute the flux operators for edge fluxes.
+
+        Given a field defined at the circumcenters, therefore of shape (N_t,), the
+        flux operator D of shape (N_e, N_t) computes the flux through each edge:
+
+        (D @ g)_ij = g_ij,+ - g_ij,-
+
+        where the pair (ij) denotes an edge from node i to node j, and g_ij,+ and g_ij,-
+        are the values of the field at the circumcenters of the two triangles sharing
+        that edge. We consider only i < j, and, traversing the edge from i to j,
+        the triangle on the left is the + triangle, and the triangle on the right is
+        the - triangle. Boundary edges use g = 0 outside the mesh, as is the case for
+        streamfunctions that have Dirichlet boundary conditions on the outer boundary
+        (which we always set to zero here).
+
+        Given a field of edge-fluxed shape (N_e,), the operator E of shape (N_v, N_e)
+        computes the divergence at each vertex. E_ij = +1 if edge j points away from
+        vertex i (if i < j), and E_ij = -1 if edge j points towards vertex i (if i > j).
+        """
+        N_v = self.vertices.shape[0]
+        N_e = self.edges.shape[0]
+        N_t = self.triangles.shape[0]
+
+        # Flux operator D
+        cols_D = np.arange(N_t)[:, None].repeat(3, axis=1)  # (N_t, 3)
+        rows_D = self._triangle_edges  # (N_t, 3)
+        signs_D = self._triangle_edge_signs  # (N_t, 3)
+        flux_operator_D = scipy.sparse.coo_matrix(
+            (signs_D.ravel(), (rows_D.ravel(), cols_D.ravel())), shape=(N_e, N_t)
+        ).tocsr()
+
+        # Divergence operator E
+        rows_E = np.concatenate([self.edges[:, 0], self.edges[:, 1]])  # (2*N_e,)
+        cols_E = np.concatenate([np.arange(N_e), np.arange(N_e)])  # (2*N_e,)
+        signs_E = np.concatenate([np.ones(N_e), -np.ones(N_e)])  # (2*N_e,)
+        divergence_operator_E = scipy.sparse.coo_matrix(
+            (signs_E, (rows_E, cols_E)), shape=(N_v, N_e)
+        ).tocsr()
+
+        return flux_operator_D, divergence_operator_E
 
     def field_curl(
         self,
@@ -1137,6 +1265,40 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         Kx = grad_field[:, 1]
         Ky = -grad_field[:, 0]
         return Kx, Ky
+
+    def nodes_from_triangles(self, triangle_field: np.ndarray) -> np.ndarray:
+        """Calculate nodal field from a field defined on the triangle circumcenters.
+
+        This function is meant for fields with a Dirichlet boundary condition on the
+        mesh boundary. The boundary value is fixed at zero.
+
+        Because there are many more triangles than vertices, the forward relation
+        g_t = B g_v between triangle fields and nodal fields is not invertible. However,
+        denoting the (N_t, N_free) submatrix by B_f, we can use the fact that the
+        least-squares solution solves
+
+        B_f^T B_f g_v = B_f^T g_t
+
+        Parameters
+        ----------
+        triangle_field: np.ndarray
+            Field defined on the triangle circumcenters. Shape (N_t,).
+
+        Returns
+        -------
+        np.ndarray
+            Nodal field reconstructed from the triangle field. Shape (N_v,).
+        """
+
+        # Solve the least-squares problem
+        rhs = self._BFT @ triangle_field  # (N_free,)
+        g_v_free = self._node_from_cc_solver.solve(rhs)  # (N_free,)
+
+        # Construct the full nodal field
+        g_v = np.zeros(self.vertices.shape[0])  # (N_v,)
+        g_v[self.free_idx] = g_v_free
+
+        return g_v
 
     @property
     def vertices(self) -> np.ndarray:
@@ -1410,6 +1572,42 @@ class SimplyConnectedFreestandingMesh(SingleBodyMesh):
         Returns a (N_t, N_e) csr matrix that maps edge-based fields to triangle-based fields.
         """
         return self._whitney_operator_y
+
+    @property
+    def node_to_cc_operator(self) -> scipy.sparse.csr_matrix:
+        """Operator that maps a field on nodes to a field on circumcenters.
+
+        Returns a (N_t, N_v) csr matrix that maps node-based fields to circumcenter-based fields.
+        """
+        return self._node_to_cc_operator
+
+    @property
+    def node_from_cc_solver(self) -> tuple[scipy.sparse.linalg.SuperLU, scipy.sparse.csr_matrix]:
+        """Solver that maps a field on circumcenters to a field on nodes.
+
+        Returns a tuple containing:
+        - A SuperLU solver for the least-squares problem B_f^T B_f g_v = B_f^T g_t
+        - A (N_free, N_t) csr matrix that is the transpose of the operator mapping
+          a field on nodes to a field on circumcenters, restricted to free vertices.
+        """
+        return self._node_from_cc_solver, self._BFT
+
+    @property
+    def edge_flux_operator(self) -> scipy.sparse.csr_matrix:
+        """Operator that maps a field on circumcenters to edge fluxes.
+
+        Returns a (N_e, N_t) csr matrix that maps circumcenter-based fields to edge
+        fluxes.
+        """
+        return self._flux_operator
+
+    @property
+    def edge_divergence_operator(self) -> scipy.sparse.csr_matrix:
+        """Operator that maps a field on edges to a field on nodes.
+
+        Returns a (N_v, N_e) csr matrix that maps edge-based fields to node-based fields.
+        """
+        return self._edge_divergence_operator
 
 
 class LondonSolver:

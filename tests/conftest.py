@@ -7,6 +7,7 @@ import torch
 import sottools.backward as backward
 import sottools.forward as forward
 from sottools.mesh import InhomogeneousOhmicSolver, SimplyConnectedCurrentMesh
+from sottools.mesh import SimplyConnectedFreestandingMesh
 
 BM = SimplyConnectedCurrentMesh.BoundaryMarker
 
@@ -502,3 +503,12 @@ def single_thread():
     torch.set_num_threads(1)
     yield
     torch.set_num_threads(n_threads)
+
+@pytest.fixture(scope="session")
+def disk_mesh_freestanding() -> SimplyConnectedFreestandingMesh:
+    """Unit disk, curved boundary; q30 guarantees obtuse triangles."""
+    n_boundary = 64
+    phi = 2 * np.pi * np.arange(n_boundary) / n_boundary
+    vertices = [[np.cos(p), np.sin(p)] for p in phi]
+    segments = [[i, (i + 1) % n_boundary] for i in range(n_boundary)]
+    return SimplyConnectedFreestandingMesh(vertices, segments, max_area=2e-3)
