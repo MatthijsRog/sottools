@@ -359,6 +359,7 @@ class Coinv2DProblem:
     )  # on fit-mesh vertices, only if fit_mesh is truth_mesh
     truth_meshtogrid: forward.MeshToGrid  # diagnostics only
     truth_streamfunction: np.ndarray  # diagnostics only
+    wall_values_true: list[float]
 
 
 def _build_coinv2d_problem(
@@ -367,6 +368,7 @@ def _build_coinv2d_problem(
     params: forward.Forward2DParameters,
     rho: np.ndarray | None = None,
     I_total: float = 1.0,
+    wall_values: list[float] | None = None,
     SNR: float = 200.0,
     seed: int = 0,
 ) -> Coinv2DProblem:
@@ -378,7 +380,10 @@ def _build_coinv2d_problem(
     assert rho.shape == (len(truth_mesh.centers),)
 
     # True current on the truth mesh
-    res = InhomogeneousOhmicSolver(truth_mesh, rho).solve(left_bc=0.0, right_bc=I_total)
+    boundary_conditions = wall_values if wall_values is not None else [0.0, I_total]
+    res = InhomogeneousOhmicSolver(truth_mesh, rho).solve(
+        boundary_conditions=boundary_conditions
+    )
     truth_streamfunction = res["streamfunction"]
 
     # Clean signal: streamfunction -> gridded currents -> forward model\
@@ -404,6 +409,7 @@ def _build_coinv2d_problem(
         streamfunction_true=truth_streamfunction if fit_mesh is truth_mesh else None,
         truth_meshtogrid=truth_meshtogrid,
         truth_streamfunction=truth_streamfunction,
+        wall_values_true=list(boundary_conditions),
     )
 
 
@@ -502,3 +508,53 @@ def single_thread():
     torch.set_num_threads(1)
     yield
     torch.set_num_threads(n_threads)
+
+
+@pytest.fixture(scope="session")
+def tjunction_input() -> tuple[list[list[float]], list[list[int]], list[BM]]:
+    """Bar along x with a stem in +y: three contacts, three walls.
+
+    Walls counter-clockwise: 0 (bottom), 1 (upper right), 2 (upper left).
+    Contacts: right end, stem top, left end.
+    """
+    vertices = [
+        [-3.0, -1.5],
+        [3.0, -1.5],
+        [3.0, -0.5],
+        [0.5, -0.5],
+        [0.5, 1.5],
+        [-0.5, 1.5],
+        [-0.5, -0.5],
+        [-3.0, -0.5],
+    ]
+    segments = [[i, (i + 1) % 8] for i in range(8)]
+    segment_markers = [
+        BM.WALL(0),
+        BM.NEUMANN_OUT,
+        BM.WALL(1),
+        BM.WALL(1),
+        BM.NEUMANN_OUT,
+        BM.WALL(2),
+        BM.WALL(2),
+        BM.NEUMANN_IN,
+    ]
+    return vertices, segments, segment_markers
+
+
+@pytest.fixture(scope="session")
+def tjunction_mesh(tjunction_input) -> SimplyConnectedCurrentMesh:
+    vertices, segments, markers = tjunction_input
+    return SimplyConnectedCurrentMesh(
+        vertices, segments, markers, max_area=4e-2, refine_distance=0.2
+    )
+
+
+@pytest.fixture(scope="session")
+def coinv2d_problem_tjunction(tjunction_mesh) -> Coinv2DProblem:
+    """Trivial problem on a three-terminal mesh."""
+    return _build_coinv2d_problem(
+        truth_mesh=tjunction_mesh,
+        fit_mesh=tjunction_mesh,
+        params=_coinv2d_params(invert_scan=False),
+        wall_values=[0.0, 1.0, 0.4],
+    )

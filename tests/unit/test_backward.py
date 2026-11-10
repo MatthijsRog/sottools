@@ -5,6 +5,7 @@ import torch
 
 import sottools.backward as backward
 import sottools.forward as forward
+from sottools.mesh import InhomogeneousOhmicSolver
 
 
 def test_1dinversion(inverter1d_with_random_currents):
@@ -806,10 +807,13 @@ def test_cached_vs_explicit_kernels_2d(invert_scan, request, make_coinverter2d):
     assert torch.allclose(cached, explicit, rtol=0, atol=1e-5 * scale)
 
 
+@pytest.mark.parametrize(
+    "problem_name", ["coinv2d_problem", "coinv2d_problem_tjunction"]
+)
 @pytest.mark.parametrize("use_cg", [True, False])
 @pytest.mark.parametrize("K", [1, 2])
 def test_coinv2d_hypergradient_fd(
-    use_cg, K, coinv2d_problem, make_coinverter2d, monkeypatch
+    use_cg, K, problem_name, request, make_coinverter2d, monkeypatch
 ):
     captured = {}
 
@@ -819,7 +823,7 @@ def test_coinv2d_hypergradient_fd(
 
     monkeypatch.setattr(backward.scipy.optimize, "minimize", stub_minimize)
     coinverter = make_coinverter2d(
-        coinv2d_problem, crossvalidation_size=K, use_cg=use_cg
+        request.getfixturevalue(problem_name), crossvalidation_size=K, use_cg=use_cg
     )
     coinverter.fit(n_steps_sensor=1, n_steps_current=500)
     theta0 = (
@@ -932,3 +936,104 @@ def test_regularizers_match_inverter2d(lumped_mass, coinv2d_problem):
         assert torch.isclose(
             getattr(inverter, name)(sv), getattr(coinverter, name)(sv), rtol=1e-6
         )
+
+
+@pytest.mark.parametrize("lumped_mass", [True, False])
+def test_harmonic_streamfunction_unregularized(lumped_mass, coinv2d_problem):
+    # An Ohmic solution satisfies K^F g = 0 for any wall values: the null space of
+    # the Tikhonov and vorticity terms
+    p = coinv2d_problem
+    mesh = p.meshtogrid.mesh
+    inverter = backward.Inverter2D(
+        p.meshtogrid, p.currentforward, p.data, lumped_mass=lumped_mass
+    )
+    rho = np.full(len(mesh.triangles), 2.0)
+    boundary_conditions = [0.3, 1.7]
+    g = InhomogeneousOhmicSolver(mesh, rho).solve(boundary_conditions)["streamfunction"]
+    noise = np.random.default_rng(0).standard_normal(len(mesh.vertices))
+
+    for name in ("_tikhonov_regularization", "_vorticity_regularization"):
+        reg = getattr(inverter, name)
+        harmonic = reg(torch.from_numpy(g).to(backward.DTYPE)).item()
+        rough = reg(torch.from_numpy(noise).to(backward.DTYPE)).item()
+        assert abs(harmonic) < 1e-3 * rough, name
+
+
+@pytest.mark.parametrize("cls", [backward.Inverter2D, backward.Coinversion2D])
+@pytest.mark.parametrize(
+    "problem_name", ["coinv2d_problem", "coinv2d_problem_tjunction"]
+)
+def test_solution_layout(cls, problem_name, request):
+    # Solution vector is [values on walls 1..T-1, free-vertex values]; wall 0 is 0
+    p = request.getfixturevalue(problem_name)
+    mesh = p.meshtogrid.mesh
+    T = mesh.N_walls
+    g = np.random.default_rng(0).standard_normal(len(mesh.vertices))
+    for k in range(T):
+        g[mesh.dirichlet_wall_mask(k)] = 1.3 * k
+
+    obj = cls(p.meshtogrid, p.currentforward, p.data, initial_streamfunction=g)
+    if cls is backward.Inverter2D:
+        solution = obj._solution
+        sv = obj._solution_to_streamvector()
+    else:
+        solution = obj._solutions[0]
+        sv = obj._solution_to_streamvector(solution)
+    solution = solution.detach().cpu().numpy()
+    g32 = g.astype(np.float32)
+
+    assert solution.shape == (T - 1 + mesh.free_idx.size,)
+    np.testing.assert_array_equal(
+        solution[: T - 1], (1.3 * np.arange(1, T)).astype(np.float32)
+    )
+    np.testing.assert_array_equal(solution[T - 1 :], g32[mesh.free_mask])
+    np.testing.assert_array_equal(sv.detach().cpu().numpy(), g32)
+
+    # Every non-gauge wall must be constant
+    bad = g.copy()
+    bad[np.flatnonzero(mesh.dirichlet_wall_mask(T - 1))[0]] += 1.0
+    with pytest.raises(ValueError):
+        cls(p.meshtogrid, p.currentforward, p.data, initial_streamfunction=bad)
+
+
+def test_2dinversion_multiterminal(coinv2d_problem_tjunction):
+    p = coinv2d_problem_tjunction
+    mesh = p.meshtogrid.mesh
+    inverter = backward.Inverter2D(
+        p.meshtogrid,
+        p.currentforward,
+        p.data,
+        lam1=1e-11,
+        lam2=1e-10,
+        lam3=1e-15,
+        lumped_mass=True,
+    )
+    g = inverter.fit(n_steps=500)["streamfunction"]
+
+    scale = np.max(np.abs(p.wall_values_true))
+    for k, value in enumerate(p.wall_values_true):
+        assert np.isclose(g[mesh.dirichlet_wall_mask(k)][0], value, atol=0.02 * scale)
+    error = g - p.streamfunction_true
+    assert np.sqrt(np.mean(error**2)) < 0.05 * scale
+
+
+@pytest.mark.slow
+def test_coinv2d_recovery_multiterminal(coinv2d_problem_tjunction, make_coinverter2d):
+    p = coinv2d_problem_tjunction
+    coinverter = make_coinverter2d(
+        p,
+        crossvalidation_size=2,
+        initial_height=0.6,
+        initial_phi_eff=np.deg2rad(55.0),
+    )
+    res = coinverter.fit(n_steps_sensor=500, n_steps_current=500)
+    h, _, _, phi_eff = res["final_sensor_parameters"]
+
+    assert abs(h - p.params.height) < 0.01
+    assert abs(phi_eff - p.params.phi_eff) < np.deg2rad(0.5)
+
+    T = p.meshtogrid.mesh.N_walls
+    scale = np.max(np.abs(p.wall_values_true))
+    np.testing.assert_allclose(
+        coinverter.solution[: T - 1], p.wall_values_true[1:], rtol=0, atol=0.02 * scale
+    )

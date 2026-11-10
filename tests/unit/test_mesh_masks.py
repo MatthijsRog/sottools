@@ -53,3 +53,23 @@ def test_dirichlet_masks(complex_mesh_input):
     assert not (mesh.dirichletleft_mask & mesh.dirichletright_mask).any()
     np.testing.assert_array_equal(mesh.free_mask, ~mesh.dirichlet_mask)
     assert mesh.free_idx.size + mesh.dirichlet_idx.size == len(mesh.vertices)
+
+
+def test_wall_masks(tjunction_input, tjunction_mesh):
+    vertices, segments, segment_markers = tjunction_input
+    mesh = tjunction_mesh
+    BM = Mesh.SimplyConnectedCurrentMesh.BoundaryMarker
+    assert mesh.N_walls == 3
+    np.testing.assert_array_equal(mesh._wall_order, [0, 1, 2])
+
+    masks = [mesh.dirichlet_wall_mask(k) for k in range(mesh.N_walls)]
+    for k, mask in enumerate(masks):
+        wall_segs = [
+            s for s, m in zip(segments, segment_markers, strict=True) if m == BM.WALL(k)
+        ]
+        expected = _on_any_segment(mesh.vertices, vertices, wall_segs)
+        np.testing.assert_array_equal(mask, expected)
+
+    # Walls are disjoint and together form the Dirichlet set
+    assert np.sum(masks, axis=0).max() == 1
+    np.testing.assert_array_equal(np.any(masks, axis=0), mesh.dirichlet_mask)

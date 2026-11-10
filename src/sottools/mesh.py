@@ -77,11 +77,34 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
     class BoundaryMarker(enum.IntEnum):
         """The various types a boundary segment can have."""
 
+        _ignore_ = "BoundaryMarker i"
         INTERIOR = 0
         DIRICHLET_LEFT = 1
         DIRICHLET_RIGHT = 2
         NEUMANN_IN = 3
         NEUMANN_OUT = 4
+        BoundaryMarker = vars()
+        for i in range(100):
+            BoundaryMarker["WALL_" + str(i)] = i + 3 if i > 1 else i + 1  # WALL_0 and
+            # WALL_1 map onto DIRICHLET_LEFT and DIRICHLET_RIGHT, all others map to 5,
+            # 6, etc
+
+        @classmethod
+        def WALL(cls, i: int) -> int:
+            """Return the marker for a wall segment."""
+            if i < 0 or i > 99:
+                raise ValueError("Wall index must be between 0 and 99")
+            return cls["WALL_" + str(i)]
+
+        @classmethod
+        def wall_index(cls, marker: int) -> int | None:
+            """Return the wall index of a boundary marker, or None for a contact."""
+            marker = cls(marker)  # Raises ValueError for unknown markers
+            if marker == cls.INTERIOR:
+                raise ValueError("INTERIOR is not a boundary marker")
+            if marker in (cls.NEUMANN_IN, cls.NEUMANN_OUT):
+                return None
+            return int(marker) - 1 if marker <= 2 else int(marker) - 3
 
     def __init__(
         self,
@@ -102,6 +125,12 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
                 f"segments ({len(segments)}) and segment_markers "
                 f"({len(segment_markers)}) must have the same length"
             )
+
+        # Check input validity and find the order of the walls:
+        self._wall_order = self._boundary_wall_order(
+            vertices, segments, segment_markers
+        )
+        self._N_walls = len(self._wall_order)
 
         # Refine
         if refine_distance is not None:
@@ -149,9 +178,7 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
         assert np.allclose(self._shapegradients.sum(axis=1), 0)
 
         # Find masks
-        self._dirichletleft_mask, self._dirichletright_mask, self._dirichlet_mask = (
-            self._dirichletmasks()
-        )
+        self._vertex_wall_number, self._dirichlet_mask = self._dirichletmasks()
         self._free_mask = ~self._dirichlet_mask
         self._free_idx = np.where(self._free_mask)[0]
         self._dirichlet_idx = np.where(self._dirichlet_mask)[0]
@@ -204,10 +231,112 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
             Dictionary representation of the object.
         """
         self.__dict__.update(state)
+
         # Recompute the factorization
         self._stiffness_matrix_solver = self._freesolver(
             self.stiffness_matrix, self.free_idx
         )
+
+    @classmethod
+    def _boundary_wall_order(
+        cls,
+        vertices: list[list[float]] | np.ndarray,
+        segments: list[list[int]] | np.ndarray,
+        segment_markers: list[BoundaryMarker] | np.ndarray,
+    ) -> np.ndarray:
+        """Validate the boundary and list its walls counter-clockwise.
+
+        The boundary must be one closed loop of alternating walls and contacts,
+        with each wall index 0..T-1 forming exactly one chain.
+
+        Returns
+        -------
+        wall_sequence : np.ndarray
+            (T,) int array of wall indices, listed as encountered when walking the
+            boundary counter-clockwise, starting at wall 0. Contact k lies between
+            walls wall_sequence[k] and wall_sequence[(k + 1) % T]. Example:
+            [0, 2, 1] means wall 0, contact 0, wall 2, contact 1, wall 1,
+            contact 2, back to wall 0.
+        """
+        segments = np.asarray(segments, dtype=int)
+
+        # Each boundary segment must have a valid marker
+        for s, marker in enumerate(segment_markers):
+            if marker == cls.BoundaryMarker.INTERIOR:
+                raise ValueError(f"Segment {s} has marker INTERIOR")
+
+        # Every boundary vertex must belong to exactly two segments
+        vertex_ids, counts = np.unique(segments, return_counts=True)
+        if np.any(counts != 2):
+            bad = vertex_ids[counts != 2].tolist()
+            raise ValueError(f"Boundary is not a closed loop at vertices {bad}")
+
+        # Map from vertex index to the two segments that contain it
+        segs_at_vertex: dict[int, list[int]] = {int(v): [] for v in vertex_ids}
+        for s, (a, b) in enumerate(segments):
+            segs_at_vertex[a].append(s)
+            segs_at_vertex[b].append(s)
+
+        # Walk the loop, recording segments and vertices in traversal order
+        seg_path = [0]
+        vertex_path = [segments[0, 0]]
+        v = segments[0, 1]
+        while v != vertex_path[0]:
+            vertex_path.append(v)
+            first, second = segs_at_vertex[v]
+            s_next = second if first == seg_path[-1] else first
+            seg_path.append(s_next)
+            a, b = segments[s_next]
+            v = b if a == v else a
+        if len(seg_path) != len(segments):
+            raise ValueError("Boundary consists of more than one closed loop")
+
+        # Group consecutive segments with equal markers into runs (cyclic)
+        runs: list[tuple[int, list[int]]] = []  # (marker, segment indices)
+        for s in seg_path:
+            marker = int(segment_markers[s])
+            if runs and runs[-1][0] == marker:
+                runs[-1][1].append(s)
+            else:
+                runs.append((marker, [s]))
+        if len(runs) > 1 and runs[0][0] == runs[-1][0]:
+            runs[0][1].extend(runs.pop()[1])
+
+        if len(runs) < 4:
+            raise ValueError("Boundary needs at least two walls and two contacts")
+
+        # Walls and contacts must alternate
+        run_walls = [cls.BoundaryMarker.wall_index(marker) for marker, _ in runs]
+        for k in range(len(runs)):
+            k_next = (k + 1) % len(runs)
+            if (run_walls[k] is None) == (run_walls[k_next] is None):
+                kind = "contacts" if run_walls[k] is None else "walls"
+                raise ValueError(
+                    f"Adjacent {kind} without separation: segments "
+                    f"{runs[k][1]} and {runs[k_next][1]}"
+                )
+
+        # Each wall index forms one chain, and indices are 0..T-1
+        wall_sequence = [w for w in run_walls if w is not None]
+        if len(set(wall_sequence)) != len(wall_sequence):
+            raise ValueError(
+                f"A wall index occurs on more than one chain: {wall_sequence}"
+            )
+        if sorted(wall_sequence) != list(range(len(wall_sequence))):
+            raise ValueError(
+                f"Wall indices must be 0..T-1 without gaps, got {sorted(wall_sequence)}"
+            )
+
+        # Orient counter-clockwise and rotate to start at wall 0
+        xy = np.asarray(vertices, dtype=float)[vertex_path]
+        signed_area = 0.5 * np.sum(
+            xy[:, 0] * np.roll(xy[:, 1], -1) - np.roll(xy[:, 0], -1) * xy[:, 1]
+        )
+        if signed_area < 0:
+            wall_sequence.reverse()
+        start = wall_sequence.index(0)
+
+        return np.array(wall_sequence[start:] + wall_sequence[:start], dtype=int)
 
     @staticmethod
     def _refine_boundary(
@@ -294,7 +423,22 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
         )
         return shapegrads
 
-    def _dirichletmasks(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _dirichletmasks(self) -> tuple[np.ndarray, np.ndarray]:
+        N_v = self.vertices.shape[0]
+        N_walls = self._N_walls
+        vertex_wall_number = np.full(N_v, -1, dtype=int)  # -1 means not a wall vertex
+        for wall_idx in range(N_walls):
+            wall_marker = self.BoundaryMarker.WALL(wall_idx)
+            seg_mask = self._segment_markers == wall_marker
+            verts = np.unique(self._segments[seg_mask].ravel())
+            vertex_wall_number[verts] = wall_idx
+
+        # Now vertex_wall_number is 0 for WALL_0, 1 for WALL_1, etc.
+        # And the dirichlet masks come from vertex_wall_number > -1 or == n.
+        dirichlet_mask = vertex_wall_number > -1
+        return vertex_wall_number, dirichlet_mask
+
+        """Legacy code, TODO: remove before pushing to git:
         N_v = self.vertices.shape[0]
 
         dirichlet_left_mask = np.zeros(N_v, dtype=bool)
@@ -310,7 +454,7 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
 
         dirichlet_mask = dirichlet_left_mask | dirichlet_right_mask
 
-        return dirichlet_left_mask, dirichlet_right_mask, dirichlet_mask
+        return dirichlet_left_mask, dirichlet_right_mask, dirichlet_mask"""
 
     def _edgedifferenceoperator(self) -> tuple[np.ndarray, scipy.sparse.csr_matrix]:
         internal_edges = []  # (t1, t2) triangle pairs where t1 and t2 share an edge
@@ -551,8 +695,10 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
 
         Returns a boolean array of length N_v, where True indicates a vertex
         is part of the boundary.
+
+        Deprecated: as of version 0.2.1, use dirichlet_wall_mask(wall_index) instead.
         """
-        return self._dirichletleft_mask
+        return self.dirichlet_wall_mask(0)  # WALL_0 is the left wall
 
     @property
     def dirichletright_mask(self) -> np.ndarray:
@@ -560,8 +706,10 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
 
         Returns a boolean array of length N_v, where True indicates a vertex
         is part of the boundary.
+
+        Deprecated: as of version 0.2.1, use dirichlet_wall_mask(wall_index) instead.
         """
-        return self._dirichletright_mask
+        return self.dirichlet_wall_mask(1)  # WALL_1 is the right wall
 
     @property
     def dirichlet_mask(self) -> np.ndarray:
@@ -571,6 +719,27 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
         is part of the boundary.
         """
         return self._dirichlet_mask
+
+    def dirichlet_wall_mask(self, wall_index: int) -> np.ndarray:
+        """Mask for Dirichlet boundary conditions on a specific wall of the mesh.
+
+        Parameters
+        ----------
+        wall_index: int
+            Index of the wall (0 to N_walls-1) for which to get the mask.
+
+        Returns
+        -------
+        mask: np.ndarray
+            Boolean array of length N_v, where True indicates a vertex is part of the
+            wall boundary WALL_{wall_index}.
+        """
+        if wall_index < 0 or wall_index >= self._N_walls:
+            raise ValueError(
+                f"wall_index must be between 0 and {self._N_walls - 1}, "
+                f"got {wall_index}"
+            )
+        return self._vertex_wall_number == wall_index
 
     @property
     def free_mask(self) -> np.ndarray:
@@ -652,6 +821,11 @@ class SimplyConnectedCurrentMesh(SingleBodyMesh):
         """
         return self._mass_matrix
 
+    @property
+    def N_walls(self) -> int:
+        """Number of walls in the mesh."""
+        return self._N_walls
+
 
 class LondonSolver:
     """Solver for the London equation in a simply connected geometry.
@@ -707,8 +881,7 @@ class LondonSolver:
 
     def solve(
         self,
-        left_bc: float,
-        right_bc: float,
+        boundary_conditions: list[float] | np.ndarray,
         max_iter: int = 50,
         alpha: float = 0.2,
         rtol: float = 1e-5,
@@ -721,14 +894,10 @@ class LondonSolver:
 
         Parameters
         ----------
-        left_bc: float
-            Dirichlet boundary condition for the streamfunction on the left
-            side of the mesh. The difference right_bc - left_bc is the total
-            current flowing through the mesh.
-        right_bc: float
-            Dirichlet boundary condition for the streamfunction on the right
-            side of the mesh. The difference right_bc - left_bc is the total
-            current flowing through the mesh.
+        boundary_conditions:
+            Streamfunction values on the walls of the mesh. The length of the list
+            must be exactly equal to the number of walls in the mesh. Element i of the
+            list corresponds to the streamfunction value on WALL_i.
         max_iter: int
             Maximum number of iterations for the Picard iteration. Defaults to
             50.
@@ -756,9 +925,16 @@ class LondonSolver:
         - "Ky": np.ndarray, the y-component of the sheet current density at the
         cell centers
         """
+        N_walls = self.mesh.N_walls
+        if len(boundary_conditions) != N_walls:
+            raise ValueError(
+                f"Length of boundary_conditions ({len(boundary_conditions)}) "
+                f"must equal number of walls ({N_walls})"
+            )
+
         # Initial streamfunction is just the solution without magnetic feedback
         Bz_initial = np.ones(self.mesh.vertices.shape[0]) * self.B_ext
-        g = self._solve_streamfunction(left_bc, right_bc, Bz=Bz_initial)
+        g = self._solve_streamfunction(boundary_conditions, Bz=Bz_initial)
 
         # Initial field is the response to this streamfunction
         Kx, Ky = self.mesh.field_curl(g)
@@ -769,7 +945,7 @@ class LondonSolver:
         for i in range(max_iter):
             if self.verbose:
                 t_start = time.time()
-            g_new = self._solve_streamfunction(left_bc, right_bc, Bz)
+            g_new = self._solve_streamfunction(boundary_conditions, Bz)
             g_old = g.copy()
             g = g * (1 - alpha) + g_new * alpha
             Kx, Ky = self.mesh.field_curl(g)
@@ -811,15 +987,15 @@ class LondonSolver:
         }
 
     def _solve_streamfunction(
-        self, left_bc: float, right_bc: float, Bz: np.ndarray
+        self, boundary_conditions: list[float] | np.ndarray, Bz: np.ndarray
     ) -> np.ndarray:
         magnetic_prefactor = 2 / (self.MU0 * self.Pearllength)
 
         N_v = self.mesh.vertices.shape[0]
 
         g_prescribed = np.zeros(N_v)
-        g_prescribed[self.mesh.dirichletleft_mask] = left_bc
-        g_prescribed[self.mesh.dirichletright_mask] = right_bc
+        for i, bc in enumerate(boundary_conditions):
+            g_prescribed[self.mesh.dirichlet_wall_mask(i)] = bc
         g_D = g_prescribed[self.mesh.dirichlet_idx]
 
         rhs_boundary = (
@@ -925,8 +1101,7 @@ class HydroSolver:
 
     def _step(
         self,
-        left_bc: float,
-        right_bc: float,
+        boundary_conditions: list[float] | np.ndarray,
         g_old: np.ndarray,  # (N_v,)
     ) -> tuple[np.ndarray, np.ndarray]:
         # Solve the hydrodynamic equations for g and omega
@@ -964,8 +1139,8 @@ class HydroSolver:
         )
 
         g = np.zeros(self.mesh.vertices.shape[0])
-        g[self.mesh.dirichletleft_mask] = left_bc
-        g[self.mesh.dirichletright_mask] = right_bc
+        for i, bc in enumerate(boundary_conditions):
+            g[self.mesh.dirichlet_wall_mask(i)] = bc
         g_D = g[self.mesh.dirichlet_idx]
         rhs_1 = -K_FD @ g_D
         rhs_2 = np.zeros(self.mesh.free_idx.shape[0])
@@ -981,8 +1156,7 @@ class HydroSolver:
 
     def solve(
         self,
-        left_bc: float,
-        right_bc: float,
+        boundary_conditions: list[float] | np.ndarray,
         alpha: float = 0.8,
         max_iter: int = 50,
         rtol: float = 1e-5,
@@ -991,10 +1165,10 @@ class HydroSolver:
 
         Parameters
         ----------
-        left_bc: float
-            The Dirichlet boundary condition on the left boundary.
-        right_bc: float
-            The Dirichlet boundary condition on the right boundary.
+        boundary_conditions: list[float] | np.ndarray
+            Streamfunction values on the walls of the mesh. The length of the list
+            must be exactly equal to the number of walls in the mesh. Element i of the
+            list corresponds to the streamfunction value on WALL_i.
         alpha: float, optional
             The relaxation parameter for the iterative solver. Defaults to 0.8.
         max_iter: int, optional
@@ -1012,14 +1186,20 @@ class HydroSolver:
             - "Kx": np.ndarray, the x-component of the sheet current density
             - "Ky": np.ndarray, the y-component of the sheet current density
         """
+        if len(boundary_conditions) != self.mesh.N_walls:
+            raise ValueError(
+                f"Length of boundary_conditions ({len(boundary_conditions)}) "
+                f"must equal number of walls ({self.mesh.N_walls})"
+            )
+
         g = np.zeros(self.mesh.vertices.shape[0])
         omega = np.zeros(self.mesh.vertices.shape[0])
-        g[self.mesh.dirichletleft_mask] = left_bc
-        g[self.mesh.dirichletright_mask] = right_bc
+        for i, bc in enumerate(boundary_conditions):
+            g[self.mesh.dirichlet_wall_mask(i)] = bc
 
         did_converge = False
         for iter in range(max_iter):
-            g_new, omega_new = self._step(left_bc, right_bc, g)
+            g_new, omega_new = self._step(boundary_conditions, g)
 
             g = (1 - alpha) * g + alpha * g_new
             omega = (1 - alpha) * omega + alpha * omega_new
@@ -1122,17 +1302,16 @@ class InhomogeneousOhmicSolver:
 
     def solve(
         self,
-        left_bc: float,
-        right_bc: float,
+        boundary_conditions: list[float] | np.ndarray,
     ) -> dict[str, np.ndarray]:
         """Solve the inhomogeneous Ohm's law for a given mesh and resistivity.
 
         Parameters
         ----------
-        left_bc: float
-            The Dirichlet boundary condition on the left boundary.
-        right_bc: float
-            The Dirichlet boundary condition on the right boundary.
+        boundary_conditions: list[float] | np.ndarray
+            Streamfunction values on the walls of the mesh. The length of the list
+            must be exactly equal to the number of walls in the mesh. Element i of the
+            list corresponds to the streamfunction value on WALL_i.
 
         Returns
         -------
@@ -1143,10 +1322,15 @@ class InhomogeneousOhmicSolver:
             - "Ky": np.ndarray, the y-component of the sheet current density
         """
         N_v = self.mesh.vertices.shape[0]
+        if len(boundary_conditions) != self.mesh.N_walls:
+            raise ValueError(
+                f"Length of boundary_conditions ({len(boundary_conditions)}) "
+                f"must equal number of walls ({self.mesh.N_walls})"
+            )
 
         g_prescribed = np.zeros(N_v)
-        g_prescribed[self.mesh.dirichletleft_mask] = left_bc
-        g_prescribed[self.mesh.dirichletright_mask] = right_bc
+        for i, bc in enumerate(boundary_conditions):
+            g_prescribed[self.mesh.dirichlet_wall_mask(i)] = bc
         g_D = g_prescribed[self.mesh.dirichlet_idx]
 
         rhs_boundary = -self.K_rho[self.mesh.free_idx][:, self.mesh.dirichlet_idx] @ g_D

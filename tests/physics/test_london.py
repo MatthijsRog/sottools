@@ -20,7 +20,7 @@ def test_bar_current(bar_mesh_london):
     solver = Mesh.LondonSolver(bar_mesh_london, pearllength)
     Bz = np.zeros(solver.mesh.vertices.shape[0])
     g = solver._solve_streamfunction(
-        0.0, Curr, Bz=Bz
+        [0.0, Curr], Bz=Bz
     )  # Find streamfunction for given total current and zero self-field
 
     # Verify g is indeed Curr * (y-ymin) / mesh_width
@@ -58,7 +58,7 @@ def test_bar_current_field(bar_mesh_london):
     solver = Mesh.LondonSolver(bar_mesh_london, pearllength)
     solver.MU0 = mu0
     g = solver._solve_streamfunction(
-        0.0, Curr, Bz=np.zeros(solver.mesh.vertices.shape[0])
+        [0.0, Curr], Bz=np.zeros(solver.mesh.vertices.shape[0])
     )
     Kx, Ky = solver.mesh.field_curl(g)
     Bz = solver._calculate_Bz(Kx, Ky)
@@ -109,7 +109,7 @@ def test_bar_current_profile(bar_mesh_london, seed):
     solver = Mesh.LondonSolver(bar_mesh_london, pearllength)
     mu0 = 4 * np.pi * 1e-1  # Standard units um, uA, uT
     solver.MU0 = mu0
-    res = solver.solve(0.0, Curr)
+    res = solver.solve([0.0, Curr])
 
     assert res["converged"] is True
 
@@ -176,7 +176,7 @@ def test_alpha_invaraince(bar_mesh_london):
 
     results = []
     for alpha in [0.1, 0.2, 0.3]:
-        res = solver.solve(0.0, Curr, alpha=alpha, max_iter=400)
+        res = solver.solve([0.0, Curr], alpha=alpha, max_iter=400)
         assert res["converged"] is True, f"Solver did not converge for alpha={alpha}"
         results.append(res)
 

@@ -47,7 +47,7 @@ def test_v_matrix(bar_mesh):
 def test_hydro_solver(bar_mesh, D):
     ten = 0.0
     solver = Mesh.HydroSolver(bar_mesh, ten, D)
-    res = solver.solve(0.0, 1.0)
+    res = solver.solve([0.0, 1.0])
     assert res["converged"]
 
     # Expected streamfunction: integral of the Gurzhi profile across the bar
@@ -94,10 +94,10 @@ def test_no_advection_straight_channel():
             vertices, segments, segment_markers, max_area=max_area
         )
         res_stokes = Mesh.HydroSolver(mesh, 0.0, D).solve(
-            left_bc, right_bc, rtol=1e-10, max_iter=200
+            [left_bc, right_bc], rtol=1e-10, max_iter=200
         )
         res_adv = Mesh.HydroSolver(mesh, ten, D).solve(
-            left_bc, right_bc, rtol=1e-10, max_iter=200
+            [left_bc, right_bc], rtol=1e-10, max_iter=200
         )
         assert res_stokes["converged"] and res_adv["converged"]
         deviations.append(
@@ -167,7 +167,7 @@ def test_advection_constriction():
 
     def solve(ten, left_bc, right_bc):
         res = Mesh.HydroSolver(mesh, ten, D).solve(
-            left_bc, right_bc, rtol=1e-10, max_iter=300
+            [left_bc, right_bc], rtol=1e-10, max_iter=300
         )
         assert res["converged"]
         return res

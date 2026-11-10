@@ -1769,7 +1769,8 @@ class Inverter2D:
         many times faster, and lumped_mass=False can stall the inversion.
     initial_streamfunction: np.ndarray, optional
         Initial guess for the streamfunction, of shape (Nmesh_vertices,). If not
-        supplied, the initial guess is zero everywhere.
+        supplied, the initial guess is zero everywhere. Must be zero on WALL_0 and
+        constant on every other wall.
     device: torch.device, optional
         The device to use for the inversion. Default is CPU.
     """
@@ -1807,9 +1808,9 @@ class Inverter2D:
 
         self._initialize_mesh_properties(device, lumped_mass)
 
-        # Initial solution vector: [right-wall value, free-node values].
+        # Initial solution vector: [N_wall wall values, free-node values].
         # The user supplies a full streamfunction (N_vertices,)
-        N_solution = 1 + int(np.sum(self._mesh.free_mask))
+        N_solution = self._N_solution
         solution0 = torch.zeros(N_solution, dtype=DTYPE, device=device)
         if initial_streamfunction is not None:
             g0 = np.asarray(initial_streamfunction, dtype=float)
@@ -1818,21 +1819,22 @@ class Inverter2D:
                     f"initial_streamfunction must have shape ({self._N_points},), "
                     f"got {g0.shape}."
                 )
-            if not np.allclose(g0[self._mesh.dirichletleft_mask], 0.0):
+            if not np.allclose(g0[self._mesh.dirichlet_wall_mask(0)], 0.0):
                 raise ValueError(
                     "initial_streamfunction must be zero on the left Dirichlet "
-                    "boundary."
+                    "/ WALL_0 boundary."
                 )
-            right_values = g0[self._mesh.dirichletright_mask]
-            if not np.allclose(right_values, right_values[0]):
-                raise ValueError(
-                    "initial_streamfunction must be constant on the right Dirichlet "
-                    "boundary."
-                )
-            solution0[0] = float(right_values[0])
-            solution0[1:] = torch.from_numpy(g0[self._mesh.free_mask]).to(
-                dtype=DTYPE, device=device
-            )
+            for free_wall_idx in range(1, self._N_walls):
+                wall_values = g0[self._mesh.dirichlet_wall_mask(free_wall_idx)]
+                if not np.allclose(wall_values, wall_values[0]):
+                    raise ValueError(
+                        f"initial_streamfunction must be constant on the "
+                        f"Dirichlet / WALL_{free_wall_idx} boundary."
+                    )
+                solution0[free_wall_idx - 1] = float(wall_values[0])
+            solution0[self._N_walls - 1 :] = torch.from_numpy(
+                g0[self._mesh.free_mask]
+            ).to(dtype=DTYPE, device=device)
         self._solution = torch.nn.Parameter(solution0)
 
     def _initialize_mesh_properties(
@@ -1841,17 +1843,20 @@ class Inverter2D:
         # Mesh properties
         self._N_points = len(self._mesh.vertices)
         self._N_free_vals = np.sum(self._mesh.free_mask)
+        self._N_walls = self._mesh.N_walls  # Amount of Dirichlet walls in the mesh.
+        if self._N_walls < 2:
+            raise ValueError(
+                f"For current inversion, need at least 2 walls! Got: {self._N_walls}"
+            )
         self._N_solution = (
-            1 + self._N_free_vals
-        )  # 1 for the Dirichlet value on the right boundary
+            self._N_walls - 1 + self._N_free_vals
+        )  # -1 for the Dirichlet value on the left boundary (remove gauge)
         self._free_mask = torch.from_numpy(self._mesh.free_mask).to(device)
         self._free_idx = torch.nonzero(self._free_mask, as_tuple=True)[0]
-        self._dirichlet_left_mask = torch.from_numpy(self._mesh.dirichletleft_mask).to(
-            device
-        )
-        self._dirichlet_right_mask = torch.from_numpy(
-            self._mesh.dirichletright_mask
-        ).to(device)
+        self._dirichlet_wall_masks = [
+            torch.from_numpy(self._mesh.dirichlet_wall_mask(i)).to(device)
+            for i in range(self._N_walls)
+        ]
         self._edge_lengths = torch.from_numpy(self._mesh.internaledgelengths).to(
             device, dtype=DTYPE
         )
@@ -1943,9 +1948,10 @@ class Inverter2D:
         streamvector = torch.zeros(
             N_points, dtype=self._solution.dtype, device=self._device
         )
-        streamvector[self._free_mask] = self._solution[1:]
-        streamvector[self._dirichlet_left_mask] = 0.0
-        streamvector[self._dirichlet_right_mask] = self._solution[0]
+        streamvector[self._free_mask] = self._solution[self._N_walls - 1 :]
+        streamvector[self._dirichlet_wall_masks[0]] = 0.0
+        for i in range(1, self._N_walls):
+            streamvector[self._dirichlet_wall_masks[i]] = self._solution[i - 1]
         return streamvector
 
     def _fidelity(self, prediction: torch.Tensor) -> torch.Tensor:
@@ -2276,7 +2282,8 @@ class Coinversion2D:
         only practical for small meshes and for testing. Default is True.
     initial_streamfunction: np.ndarray, optional
         Initial guess for the streamfunction, of shape (Nmesh_vertices,). If not
-        supplied, the initial guess is zero everywhere.
+        supplied, the initial guess is zero everywhere. Must be zero on WALL_0 and
+        constant on every other wall.
     verbose : bool, optional
         Whether to print verbose output. Default is False.
 
@@ -2401,17 +2408,20 @@ class Coinversion2D:
         # Mesh properties
         self._N_points = len(self._mesh.vertices)
         self._N_free_vals = np.sum(self._mesh.free_mask)
+        self._N_walls = self._mesh.N_walls  # Amount of Dirichlet walls in the mesh.
+        if self._N_walls < 2:
+            raise ValueError(
+                f"For current inversion, need at least 2 walls! Got: {self._N_walls}"
+            )
         self._N_solution = (
-            1 + self._N_free_vals
-        )  # 1 for the Dirichlet value on the right boundary
+            self._N_walls - 1 + self._N_free_vals
+        )  # -1 for the Dirichlet value on the left boundary (remove gauge)
         self._free_mask = torch.from_numpy(self._mesh.free_mask).to(device)
         self._free_idx = torch.nonzero(self._free_mask, as_tuple=True)[0]
-        self._dirichlet_left_mask = torch.from_numpy(self._mesh.dirichletleft_mask).to(
-            device
-        )
-        self._dirichlet_right_mask = torch.from_numpy(
-            self._mesh.dirichletright_mask
-        ).to(device)
+        self._dirichlet_wall_masks = [
+            torch.from_numpy(self._mesh.dirichlet_wall_mask(i)).to(device)
+            for i in range(self._N_walls)
+        ]
         self._edge_lengths = torch.from_numpy(self._mesh.internaledgelengths).to(
             device, dtype=DTYPE
         )
@@ -2544,9 +2554,10 @@ class Coinversion2D:
         N_points = len(self._mesh.vertices)
 
         streamvector = torch.zeros(N_points, dtype=solution.dtype, device=self._device)
-        streamvector[self._free_mask] = solution[1:]
-        streamvector[self._dirichlet_left_mask] = 0.0
-        streamvector[self._dirichlet_right_mask] = solution[0]
+        streamvector[self._free_mask] = solution[self._N_walls - 1 :]
+        streamvector[self._dirichlet_wall_masks[0]] = 0.0
+        for i in range(1, self._N_walls):
+            streamvector[self._dirichlet_wall_masks[i]] = solution[i - 1]
         return streamvector
 
     def _signal(
@@ -3281,7 +3292,7 @@ class Coinversion2D:
         self._lam3 = self._lam3_initial
         self._huber_e = self._huber_e_initial
 
-        N_solution = 1 + int(np.sum(self._mesh.free_mask))
+        N_solution = self._N_solution
         solution0 = torch.zeros(N_solution, dtype=DTYPE, device=self._device)
         if self._initial_streamfunction is not None:
             g0 = np.asarray(self._initial_streamfunction, dtype=float)
@@ -3290,21 +3301,22 @@ class Coinversion2D:
                     f"initial_streamfunction must have shape ({self._N_points},), "
                     f"got {g0.shape}."
                 )
-            if not np.allclose(g0[self._mesh.dirichletleft_mask], 0.0):
+            if not np.allclose(g0[self._mesh.dirichlet_wall_mask(0)], 0.0):
                 raise ValueError(
                     "initial_streamfunction must be zero on the left Dirichlet "
-                    "boundary."
+                    "/ WALL_0 boundary."
                 )
-            right_values = g0[self._mesh.dirichletright_mask]
-            if not np.allclose(right_values, right_values[0]):
-                raise ValueError(
-                    "initial_streamfunction must be constant on the right Dirichlet "
-                    "boundary."
-                )
-            solution0[0] = float(right_values[0])
-            solution0[1:] = torch.from_numpy(g0[self._mesh.free_mask]).to(
-                dtype=DTYPE, device=self._device
-            )
+            for free_wall_idx in range(1, self._N_walls):
+                wall_values = g0[self._mesh.dirichlet_wall_mask(free_wall_idx)]
+                if not np.allclose(wall_values, wall_values[0]):
+                    raise ValueError(
+                        f"initial_streamfunction must be constant on the "
+                        f"Dirichlet / WALL_{free_wall_idx} boundary."
+                    )
+                solution0[free_wall_idx - 1] = float(wall_values[0])
+            solution0[self._N_walls - 1 :] = torch.from_numpy(
+                g0[self._mesh.free_mask]
+            ).to(dtype=DTYPE, device=self._device)
 
         self._solutions = [
             solution0.clone().detach().requires_grad_(True)
